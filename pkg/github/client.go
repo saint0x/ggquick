@@ -52,16 +52,39 @@ func New(logger *log.Logger) *Client {
 
 // CreatePR creates a new pull request
 func (c *Client) CreatePR(ctx context.Context, owner, repo, title, body, head, base string) (*github.PullRequest, error) {
-	pr, _, err := c.client.PullRequests.Create(ctx, owner, repo, &github.NewPullRequest{
+	// Format head branch to include owner for cross-repo PRs
+	// If head doesn't contain ':', prefix it with owner
+	if !strings.Contains(head, ":") {
+		head = fmt.Sprintf("%s:%s", owner, head)
+	}
+
+	c.logger.Debug("Creating PR: title=%s, head=%s, base=%s", title, head, base)
+	pr, resp, err := c.client.PullRequests.Create(ctx, owner, repo, &github.NewPullRequest{
 		Title: github.String(title),
 		Body:  github.String(body),
 		Head:  github.String(head),
 		Base:  github.String(base),
 	})
 	if err != nil {
+		if resp != nil {
+			c.logger.Warning("Failed to create PR: status=%d", resp.StatusCode)
+			if resp.StatusCode == 422 {
+				c.logger.Debug("This might be due to PR already existing or invalid branch names")
+				// Check if PR already exists
+				existingPRs, _, listErr := c.client.PullRequests.List(ctx, owner, repo, &github.PullRequestListOptions{
+					Head: head,
+					Base: base,
+				})
+				if listErr == nil && len(existingPRs) > 0 {
+					c.logger.Warning("PR already exists between these branches")
+					return existingPRs[0], nil
+				}
+			}
+		}
 		return nil, fmt.Errorf("failed to create PR: %w", err)
 	}
 
+	c.logger.Debug("Successfully created PR #%d", pr.GetNumber())
 	return pr, nil
 }
 
