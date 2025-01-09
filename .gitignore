@@ -1,0 +1,24 @@
+# Development and planning
+DEVELOPMENT.md
+TODO.md
+
+# Build
+bin/
+dist/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work.env
