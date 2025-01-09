@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,47 +39,73 @@ func (m *mockGenerator) AnalyzeCode(string) (*ai.Analysis, error) {
 	return &ai.Analysis{}, nil
 }
 
-// mockClient implements GitHubClient
+// mockClient implements GitHubClient for testing
 type mockClient struct {
-	prCreated     bool
-	prTitle       string
-	prBody        string
-	prHead        string
-	prBase        string
-	defaultBranch string
+	createPRFunc         func(context.Context, string, string, string, string, string, string) (*gogithub.PullRequest, error)
+	getDefaultBranchFunc func(context.Context, string, string) (string, error)
+	parseRepoURLFunc     func(string) (string, string, error)
+	getContributingFunc  func(context.Context, string, string) (string, error)
+	getBranchesFunc      func(context.Context, string, string) ([]*gogithub.Branch, error)
+	getPRsFunc           func(context.Context, string, string, int) ([]*gogithub.PullRequest, error)
+	getDiffFunc          func(context.Context, string, string, string, string) (string, error)
+	getCommitMessageFunc func(context.Context, string, string, string) (string, error)
+	prCreated            bool
 }
 
-func (m *mockClient) CreatePR(_ context.Context, _, _, title, body, head, base string) (*gogithub.PullRequest, error) {
-	m.prCreated = true
-	m.prTitle = title
-	m.prBody = body
-	m.prHead = head
-	m.prBase = base
-	return &gogithub.PullRequest{}, nil
-}
-
-func (m *mockClient) GetDefaultBranch(_ context.Context, _, _ string) (string, error) {
-	return m.defaultBranch, nil
-}
-
-func (m *mockClient) ParseRepoURL(url string) (owner, repo string, err error) {
-	return "test-owner", "test-repo", nil
-}
-
-func (m *mockClient) GetContributingGuide(_ context.Context, _, _ string) (string, error) {
-	return "", nil
-}
-
-func (m *mockClient) GetBranches(_ context.Context, _, _ string) ([]*gogithub.Branch, error) {
+func (m *mockClient) CreatePR(ctx context.Context, owner, repo, title, body, head, base string) (*gogithub.PullRequest, error) {
+	if m.createPRFunc != nil {
+		return m.createPRFunc(ctx, owner, repo, title, body, head, base)
+	}
 	return nil, nil
 }
 
-func (m *mockClient) GetPRs(_ context.Context, _, _ string, _ int) ([]*gogithub.PullRequest, error) {
+func (m *mockClient) GetDefaultBranch(ctx context.Context, owner, repo string) (string, error) {
+	if m.getDefaultBranchFunc != nil {
+		return m.getDefaultBranchFunc(ctx, owner, repo)
+	}
+	return "main", nil
+}
+
+func (m *mockClient) ParseRepoURL(url string) (string, string, error) {
+	if m.parseRepoURLFunc != nil {
+		return m.parseRepoURLFunc(url)
+	}
+	return "owner", "repo", nil
+}
+
+func (m *mockClient) GetContributingGuide(ctx context.Context, owner, repo string) (string, error) {
+	if m.getContributingFunc != nil {
+		return m.getContributingFunc(ctx, owner, repo)
+	}
+	return "", nil
+}
+
+func (m *mockClient) GetBranches(ctx context.Context, owner, repo string) ([]*gogithub.Branch, error) {
+	if m.getBranchesFunc != nil {
+		return m.getBranchesFunc(ctx, owner, repo)
+	}
 	return nil, nil
 }
 
-func (m *mockClient) GetDiff(_ context.Context, _, _, _, _ string) (string, error) {
+func (m *mockClient) GetPRs(ctx context.Context, owner, repo string, limit int) ([]*gogithub.PullRequest, error) {
+	if m.getPRsFunc != nil {
+		return m.getPRsFunc(ctx, owner, repo, limit)
+	}
+	return nil, nil
+}
+
+func (m *mockClient) GetDiff(ctx context.Context, owner, repo, base, head string) (string, error) {
+	if m.getDiffFunc != nil {
+		return m.getDiffFunc(ctx, owner, repo, base, head)
+	}
 	return "", nil
+}
+
+func (m *mockClient) GetCommitMessage(ctx context.Context, owner, repo, sha string) (string, error) {
+	if m.getCommitMessageFunc != nil {
+		return m.getCommitMessageFunc(ctx, owner, repo, sha)
+	}
+	return "test commit message", nil
 }
 
 // mockManager implements HooksManager
@@ -99,9 +126,7 @@ func setupTestServer(t *testing.T) (*Server, *mockGenerator, *mockClient, func()
 		titleResp: "Test PR Title",
 		descResp:  "Test PR Description",
 	}
-	mockGH := &mockClient{
-		defaultBranch: "main",
-	}
+	mockGH := &mockClient{}
 	mockHooks := &mockManager{}
 
 	s, err := New(logger, mockGen, mockGH, mockHooks)
@@ -194,5 +219,40 @@ func TestWebhookHandling(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestServer_handlePush(t *testing.T) {
+	mockGen := &mockGenerator{
+		titleResp: "Test PR Title",
+		descResp:  "Test PR Description",
+	}
+	mockGH := &mockClient{
+		createPRFunc: func(ctx context.Context, owner, repo, title, body, head, base string) (*gogithub.PullRequest, error) {
+			return &gogithub.PullRequest{}, nil
+		},
+		getDefaultBranchFunc: func(ctx context.Context, owner, repo string) (string, error) {
+			return "main", nil
+		},
+	}
+	mockHooks := &mockManager{}
+
+	srv, err := New(log.New(true), mockGen, mockGH, mockHooks)
+	if err != nil {
+		t.Fatal("Failed to create server:", err)
+	}
+
+	// Create test request
+	body := strings.NewReader(`{"ref": "refs/heads/test-branch"}`)
+	req := httptest.NewRequest(http.MethodPost, "/push", body)
+	w := httptest.NewRecorder()
+
+	// Handle request
+	srv.handlePush(w, req)
+
+	// Check response
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status OK; got %v", resp.Status)
 	}
 }
