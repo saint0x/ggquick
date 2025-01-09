@@ -35,6 +35,7 @@ const (
 	gitEmoji     = "📦 "
 	branchEmoji  = "🌿 "
 	diffEmoji    = "📝 "
+	loadingEmoji = "⏳ "
 )
 
 // Logger struct with debug flag
@@ -111,7 +112,7 @@ func (l *Logger) Step(format string, args ...interface{}) {
 	fmt.Printf("%s%s%s%s\n", cyan, stepEmoji, formatMessage(msg), reset)
 }
 
-// Debug prints a debug message if debug is enabled
+// Debug prints a debug message
 func (l *Logger) Debug(format string, args ...interface{}) {
 	if !l.debug {
 		return
@@ -129,7 +130,7 @@ func (l *Logger) PR(format string, args ...interface{}) {
 // Git prints a git-related message
 func (l *Logger) Git(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	fmt.Printf("%s%s%s%s\n", white, gitEmoji, formatMessage(msg), reset)
+	fmt.Printf("%s%s%s%s\n", blue, gitEmoji, formatMessage(msg), reset)
 }
 
 // Branch prints a branch-related message
@@ -142,6 +143,12 @@ func (l *Logger) Branch(format string, args ...interface{}) {
 func (l *Logger) Diff(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	fmt.Printf("%s%s%s%s\n", yellow, diffEmoji, formatMessage(msg), reset)
+}
+
+// Loading prints a loading/progress message
+func (l *Logger) Loading(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	fmt.Printf("%s%s%s%s\n", cyan, loadingEmoji, formatMessage(msg), reset)
 }
 
 // IsDebug returns whether debug logging is enabled

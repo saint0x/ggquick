@@ -113,10 +113,11 @@ func (m *Manager) CreatePullRequest(ctx context.Context, opts *PullRequestOption
 func (m *Manager) InstallHooks(repoPath string) error {
 	// Install post-commit hook
 	hook := fmt.Sprintf(`#!/bin/sh
-if port=$(cat ~/.ggquick/port 2>/dev/null); then
-    git log -1 --format="%%H%%n%%s%%n%%an" HEAD | \
-    curl -s -X POST "http://localhost:$port/push" \
-         -H "Content-Type: text/plain" --data-binary @-
+# ggquick post-commit hook
+if [ -z "$GGQUICK_DISABLED" ]; then
+	curl -s -X POST "https://ggquick.fly.dev/push" \
+		-H "Content-Type: application/json" \
+		-d "{\"ref\":\"$(git rev-parse --abbrev-ref HEAD)\",\"sha\":\"$(git rev-parse HEAD)\"}" >/dev/null || true
 fi
 `)
 
@@ -127,12 +128,11 @@ fi
 
 	// Install post-push hook
 	hook = fmt.Sprintf(`#!/bin/sh
-if port=$(cat ~/.ggquick/port 2>/dev/null); then
-    while read local_ref local_sha remote_ref remote_sha; do
-        curl -s -X POST "http://localhost:$port/push" \
-             -H "Content-Type: application/json" \
-             -d "{\"ref\":\"$remote_ref\",\"before\":\"$local_sha\",\"after\":\"$remote_sha\"}"
-    done
+# ggquick post-push hook
+if [ -z "$GGQUICK_DISABLED" ]; then
+	curl -s -X POST "https://ggquick.fly.dev/push" \
+		-H "Content-Type: application/json" \
+		-d "{\"ref\":\"$(git rev-parse --abbrev-ref HEAD)\",\"sha\":\"$(git rev-parse HEAD)\"}" >/dev/null || true
 fi
 `)
 
@@ -162,23 +162,25 @@ func (m *Manager) UpdateRepo(repo *RepoInfo) error {
 		{
 			Name: "post-commit",
 			Template: `#!/bin/sh
-if port=$(cat ~/.ggquick/port 2>/dev/null); then
-    git log -1 --format="%H%n%s%n%an" HEAD | \
-    curl -s -X POST "http://localhost:$port/push" \
-         -H "Content-Type: text/plain" --data-binary @-
-fi`,
+# ggquick post-commit hook
+if [ -z "$GGQUICK_DISABLED" ]; then
+	curl -s -X POST "https://ggquick.fly.dev/push" \
+		-H "Content-Type: application/json" \
+		-d "{\"ref\":\"$(git rev-parse --abbrev-ref HEAD)\",\"sha\":\"$(git rev-parse HEAD)\"}" >/dev/null || true
+fi
+`,
 			Enabled: true,
 		},
 		{
 			Name: "post-push",
 			Template: `#!/bin/sh
-if port=$(cat ~/.ggquick/port 2>/dev/null); then
-    while read local_ref local_sha remote_ref remote_sha; do
-        curl -s -X POST "http://localhost:$port/push" \
-             -H "Content-Type: application/json" \
-             -d "{\"ref\":\"$remote_ref\",\"before\":\"$local_sha\",\"after\":\"$remote_sha\"}"
-    done
-fi`,
+# ggquick post-push hook
+if [ -z "$GGQUICK_DISABLED" ]; then
+	curl -s -X POST "https://ggquick.fly.dev/push" \
+		-H "Content-Type: application/json" \
+		-d "{\"ref\":\"$(git rev-parse --abbrev-ref HEAD)\",\"sha\":\"$(git rev-parse HEAD)\"}" >/dev/null || true
+fi
+`,
 			Enabled: true,
 		},
 	}

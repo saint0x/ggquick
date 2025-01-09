@@ -1,82 +1,65 @@
-# ggquick 🚀
+# ggquick
 
-AI-powered GitHub PR automation. Automatically creates well-formatted pull requests when you push new branches.
+AI-powered PR generator that creates detailed, conversational pull requests from your Git changes.
 
 ## Features
 
-- 🤖 Automatic PR creation on branch push
-- 🎯 AI-generated titles and descriptions
-- 📝 Follows repository contributing guidelines
-- 🔄 Zero-config git hook integration
+- 🤖 Automatically generates PRs when you push new branches
+- 🎯 Creates detailed, conversational PR descriptions that explain the changes thoroughly
+- 📝 Follows repository contributing guidelines when generating PRs
+- 🔄 Handles rate limiting for webhook events
+- 🔒 Secure token management for GitHub and OpenAI
 
-## Quick Start
+## Installation
 
 ```bash
-# Clone and setup
-git clone https://github.com/saint0x/ggquick.git
+# Clone the repository
+git clone https://github.com/saint0x/ggquick
 cd ggquick
 
-# Add your GitHub token to the environment
-export GITHUB_TOKEN=your_github_token
-export GITHUB_REPOSITORY=username/repo
-
-# Run the installer
-chmod +x build.sh && ./build.sh
+# Build and install
+./build.sh
 ```
 
-## Usage
+## Setup
 
-Start the server:
+1. Create a `.env` file in the project root:
+```
+GITHUB_TOKEN=your_github_token
+OPENAI_API_KEY=your_openai_key
+```
+
+2. Start listening for changes:
 ```bash
 ggquick start
 ```
 
-Check server status:
+## Usage
+
+1. Create and switch to a new branch:
 ```bash
-ggquick check
+git checkout -b feature/my-changes
 ```
 
-Stop the server:
+2. Make your changes and commit them:
 ```bash
-ggquick stop
+git add .
+git commit -m "feat: add new feature"
 ```
 
-Enable debug logging:
+3. Push your branch:
 ```bash
-ggquick start --debug
+git push origin feature/my-changes
 ```
 
-## Environment Variables
+ggquick will automatically:
+- Detect your push
+- Analyze the changes
+- Generate a detailed, conversational PR description
+- Create a pull request on GitHub
 
-- `GITHUB_TOKEN`: Required. GitHub personal access token with repo scope
-- `GITHUB_REPOSITORY`: Required. Repository to create PRs in (e.g., username/repo)
-- `GGQUICK_PORT`: Optional. Server port (default: 8080)
+## Commands
 
-## How it Works
-
-1. When you push a new branch, git hooks notify the background server
-2. The server analyzes your changes using AI
-3. It fetches the repository's contributing guidelines
-4. Creates a well-formatted PR following the guidelines
-
-## Troubleshooting
-
-1. Check server status:
-   ```bash
-   ggquick check
-   ```
-
-2. If server isn't running:
-   ```bash
-   ggquick start --debug  # Start with verbose logging
-   ```
-
-3. If server is stuck:
-   ```bash
-   ggquick stop
-   ggquick start
-   ```
-
-## License
-
-MIT - Hack away! 🛠️ 
+- `ggquick start` - Start listening for Git events
+- `ggquick check` - Check server status
+- `ggquick stop` - Stop the server 

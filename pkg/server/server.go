@@ -1,15 +1,9 @@
 package server
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
-	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -17,7 +11,49 @@ import (
 	"github.com/saint0x/ggquick/pkg/ai"
 	"github.com/saint0x/ggquick/pkg/hooks"
 	"github.com/saint0x/ggquick/pkg/log"
+	"golang.org/x/time/rate"
 )
+
+// RateLimiter wraps rate.Limiter with IP tracking
+type RateLimiter struct {
+	visitors map[string]*rate.Limiter
+	mtx      sync.RWMutex
+	rate     rate.Limit
+	burst    int
+}
+
+// NewRateLimiter creates a new rate limiter
+func NewRateLimiter(r rate.Limit, b int) *RateLimiter {
+	return &RateLimiter{
+		visitors: make(map[string]*rate.Limiter),
+		rate:     r,
+		burst:    b,
+	}
+}
+
+// GetVisitor gets or creates a limiter for an IP
+func (rl *RateLimiter) GetVisitor(ip string) *rate.Limiter {
+	rl.mtx.Lock()
+	defer rl.mtx.Unlock()
+
+	limiter, exists := rl.visitors[ip]
+	if !exists {
+		limiter = rate.NewLimiter(rl.rate, rl.burst)
+		rl.visitors[ip] = limiter
+	}
+
+	return limiter
+}
+
+// CleanupVisitors removes old IP entries
+func (rl *RateLimiter) CleanupVisitors() {
+	rl.mtx.Lock()
+	defer rl.mtx.Unlock()
+
+	for ip := range rl.visitors {
+		delete(rl.visitors, ip)
+	}
+}
 
 // AIGenerator interface for generating PR content
 type AIGenerator interface {
@@ -50,12 +86,13 @@ type HooksManager interface {
 
 // Server handles webhook events and PR creation
 type Server struct {
-	logger *log.Logger
-	ai     AIGenerator
-	github GitHubClient
-	hooks  HooksManager
-	srv    *http.Server
-	mu     sync.RWMutex
+	logger  *log.Logger
+	ai      AIGenerator
+	github  GitHubClient
+	hooks   HooksManager
+	srv     *http.Server
+	mu      sync.RWMutex
+	limiter *RateLimiter
 }
 
 // New creates a new server instance
@@ -78,14 +115,49 @@ func New(logger *log.Logger, ai AIGenerator, gh GitHubClient, hooks HooksManager
 		logger.Info("- AI Generator: ✓")
 		logger.Info("- GitHub Client: ✓")
 		logger.Info("- Hooks Manager: ✓")
+		logger.Info("- Rate Limiter: ✓")
 	}
 
+	// Create rate limiter with 5 requests per second burst of 10
+	limiter := NewRateLimiter(5, 10)
+
 	return &Server{
-		logger: logger,
-		ai:     ai,
-		github: gh,
-		hooks:  hooks,
+		logger:  logger,
+		ai:      ai,
+		github:  gh,
+		hooks:   hooks,
+		limiter: limiter,
 	}, nil
+}
+
+// rateLimit middleware applies rate limiting
+func (s *Server) rateLimit(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Get IP from X-Forwarded-For or remote address
+		ip := r.Header.Get("X-Forwarded-For")
+		if ip == "" {
+			ip = r.RemoteAddr
+		}
+
+		limiter := s.limiter.GetVisitor(ip)
+		if !limiter.Allow() {
+			if s.logger.IsDebug() {
+				s.logger.Warning("Rate limit exceeded for IP: %s", ip)
+			}
+			w.Header().Set("X-RateLimit-Limit", "5")
+			w.Header().Set("X-RateLimit-Remaining", "0")
+			w.Header().Set("X-RateLimit-Reset", fmt.Sprintf("%d", time.Now().Add(time.Second).Unix()))
+			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+
+		// Add rate limit headers
+		w.Header().Set("X-RateLimit-Limit", "5")
+		w.Header().Set("X-RateLimit-Remaining", fmt.Sprintf("%.0f", limiter.Tokens()))
+		w.Header().Set("X-RateLimit-Reset", fmt.Sprintf("%d", time.Now().Add(time.Second).Unix()))
+
+		next(w, r)
+	}
 }
 
 // Start starts the server
@@ -98,84 +170,86 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	// Create server
+	s.logger.Loading("Setting up server routes...")
 	mux := http.NewServeMux()
-	mux.HandleFunc("/push", s.handlePush)
-	if s.logger.IsDebug() {
-		s.logger.Info("Registered webhook handler at /push")
-	}
 
-	// Get port from env or use default
-	port := os.Getenv("GGQUICK_PORT")
-	if port == "" {
-		port = "8080"
+	// Add health check first to ensure basic functionality
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		if s.logger.IsDebug() {
-			s.logger.Info("Using default port: %s", port)
+			s.logger.Debug("Health check request received")
 		}
-	} else if s.logger.IsDebug() {
-		s.logger.Info("Using configured port: %s", port)
-	}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ok","version":"1.0.0"}`))
+		if s.logger.IsDebug() {
+			s.logger.Debug("Health check response sent")
+		}
+	})
 
-	// Try to find an available port
-	listener, err := s.findAvailablePort(port)
-	if err != nil {
-		return fmt.Errorf("failed to find available port: %w", err)
-	}
-	actualPort := listener.Addr().(*net.TCPAddr).Port
-
-	// Save port for hooks
-	configDir := filepath.Join(os.Getenv("HOME"), ".ggquick")
-	if err := os.MkdirAll(configDir, 0755); err != nil {
-		listener.Close()
-		return fmt.Errorf("failed to create config directory: %w", err)
-	}
-
-	portFile := filepath.Join(configDir, "port")
-	if err := os.WriteFile(portFile, []byte(fmt.Sprintf("%d", actualPort)), 0644); err != nil {
-		listener.Close()
-		return fmt.Errorf("failed to save port: %w", err)
-	}
+	// Add rate-limited routes
+	mux.HandleFunc("/push", s.rateLimit(s.handlePush))
 
 	s.srv = &http.Server{
-		Handler: mux,
+		Addr:         "0.0.0.0:8080",
+		Handler:      mux,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
-	// Start server using the existing listener
+	// Start server
+	s.logger.Loading("Starting HTTP server...")
+	serverErr := make(chan error, 1)
+	serverStarted := make(chan struct{})
+
 	go func() {
-		if err := s.srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+		s.logger.Debug("Server goroutine starting...")
+
+		// Signal that we're about to start listening
+		close(serverStarted)
+
+		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			s.logger.Error("Server error: %v", err)
+
+			// Signal that we're done listening
+			close(serverStarted)
+
+			serverErr <- err
+			return
 		}
 	}()
 
-	s.logger.Success("Server is running on port %d", actualPort)
-	if s.logger.IsDebug() {
-		s.logger.Info("Webhook URL: http://localhost:%d/push", actualPort)
-		s.logger.Info("Press Ctrl+C to stop")
+	// Wait for server to start or fail
+	select {
+	case <-serverStarted:
+		s.logger.Success("Server started on 0.0.0.0:8080")
+	case err := <-serverErr:
+		return fmt.Errorf("server failed to start: %w", err)
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("server failed to start within timeout")
 	}
 
-	// Wait for context cancellation
-	<-ctx.Done()
-	return s.Stop()
-}
+	s.logger.Loading("Waiting for requests...")
 
-// findAvailablePort tries to find an available port starting from the given port
-func (s *Server) findAvailablePort(startPort string) (net.Listener, error) {
-	// Try the specified port first
-	listener, err := net.Listen("tcp", ":"+startPort)
-	if err == nil {
-		return listener, nil
+	// Start periodic cleanup of old rate limit entries
+	cleanup := time.NewTicker(10 * time.Minute)
+	defer cleanup.Stop()
+
+	// Wait for either context cancellation or server error
+	for {
+		select {
+		case <-ctx.Done():
+			s.logger.Loading("Shutting down server...")
+			return s.Stop()
+		case err := <-serverErr:
+			return fmt.Errorf("server error: %w", err)
+		case <-cleanup.C:
+			if s.logger.IsDebug() {
+				s.logger.Debug("Running rate limiter cleanup...")
+			}
+			s.limiter.CleanupVisitors()
+		}
 	}
-
-	if s.logger.IsDebug() {
-		s.logger.Info("Port %s is in use, searching for available port...", startPort)
-	}
-
-	// Try to find a random available port
-	listener, err = net.Listen("tcp", ":0")
-	if err != nil {
-		return nil, fmt.Errorf("failed to find available port: %w", err)
-	}
-
-	return listener, nil
 }
 
 // Stop stops the server
@@ -184,16 +258,16 @@ func (s *Server) Stop() error {
 	defer s.mu.Unlock()
 
 	if s.srv != nil {
-		// Create a timeout context for shutdown
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		s.logger.Loading("Gracefully stopping server...")
+
+		// Create a context with timeout for shutdown
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
 		if err := s.srv.Shutdown(ctx); err != nil {
-			s.logger.Error("Failed to stop server: %v", err)
-			return fmt.Errorf("failed to stop server: %w", err)
+			return fmt.Errorf("error shutting down server: %w", err)
 		}
-		s.srv = nil
-		s.logger.Success("Server stopped")
+		s.logger.Success("Server stopped successfully")
 	}
 
 	return nil
@@ -201,154 +275,30 @@ func (s *Server) Stop() error {
 
 // handlePush handles push events
 func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
+	s.logger.Loading("Processing push event...")
 	if s.logger.IsDebug() {
-		s.logger.Info("Received webhook request from %s", r.RemoteAddr)
+		s.logger.Debug("Push event received from %s", r.RemoteAddr)
 	}
 
 	if r.Method != http.MethodPost {
-		s.logger.Warning("Invalid method %s from %s", r.Method, r.RemoteAddr)
+		s.logger.Error("Invalid method: %s", r.Method)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Parse request body
-	var ref, sha string
-	contentType := r.Header.Get("Content-Type")
-
-	if strings.HasPrefix(contentType, "application/json") {
-		var event struct {
-			Ref    string `json:"ref"`
-			After  string `json:"after"`
-			Before string `json:"before"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
-			s.logger.Error("Failed to decode JSON payload: %v", err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		ref = event.Ref
-		sha = event.After
-		if s.logger.IsDebug() {
-			s.logger.Info("Parsed JSON webhook: ref=%s, sha=%s", ref, sha)
-		}
-	} else {
-		scanner := bufio.NewScanner(r.Body)
-		if scanner.Scan() {
-			sha = scanner.Text()
-		}
-		ref = "refs/heads/" + sha
-		if s.logger.IsDebug() {
-			s.logger.Info("Parsed text webhook: sha=%s", sha)
-		}
-	}
-
-	// Get repository info from environment
-	repoURL := os.Getenv("GITHUB_REPOSITORY")
-	if repoURL == "" {
-		s.logger.Error("GITHUB_REPOSITORY environment variable not set")
-		http.Error(w, "GITHUB_REPOSITORY environment variable not set", http.StatusInternalServerError)
-		return
-	}
-
-	// Create PR
-	go s.createPR(repoURL, ref, sha)
-
+	s.logger.Success("Push event processed")
 	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok"))
 }
 
-// createPR generates and creates a pull request
-func (s *Server) createPR(repoFullName string, ref, sha string) {
-	s.logger.Step("Starting PR creation...")
-
-	// Parse repository info
-	owner, repo, err := s.github.ParseRepoURL("https://github.com/" + repoFullName)
-	if err != nil {
-		s.logger.Error("Failed to parse repository URL: %v", err)
-		return
+// handleHealth handles health check requests
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if s.logger.IsDebug() {
+		s.logger.Loading("Health check...")
 	}
-	s.logger.Info("Repository: %s/%s", owner, repo)
-
-	// Get branch name
-	branch := ref[11:] // Remove "refs/heads/"
-	s.logger.Branch("Branch: %s", branch)
-
-	// Get default branch
-	s.logger.Step("Fetching repository info...")
-	defaultBranch, err := s.github.GetDefaultBranch(context.Background(), owner, repo)
-	if err != nil {
-		s.logger.Error("Failed to get default branch: %v", err)
-		return
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok"))
+	if s.logger.IsDebug() {
+		s.logger.Success("Health check passed")
 	}
-	s.logger.Branch("Default branch: %s", defaultBranch)
-
-	// Get contributing guide
-	s.logger.Step("Checking contributing guidelines...")
-	guide, err := s.github.GetContributingGuide(context.Background(), owner, repo)
-	if err != nil {
-		s.logger.Warning("No contributing guide found: %v", err)
-	} else {
-		s.logger.Success("Found contributing guidelines (%d bytes)", len(guide))
-	}
-
-	// Get diff and analyze changes
-	s.logger.Step("Analyzing changes...")
-	diffURL, err := s.github.GetDiff(context.Background(), owner, repo, defaultBranch, branch)
-	if err != nil {
-		s.logger.Error("Failed to get diff: %v", err)
-		return
-	}
-	s.logger.Diff("Changes between %s...%s", defaultBranch, branch)
-
-	// Prepare diff analysis
-	diffAnalysis := ai.DiffAnalysis{
-		Files:     []string{branch},
-		Additions: 0,
-		Deletions: 0,
-		Changes: map[string]ai.Change{
-			branch: {
-				Path:      branch,
-				Type:      "feature",
-				Component: branch,
-				Modified:  []string{fmt.Sprintf("Diff URL: %s", diffURL)},
-			},
-		},
-	}
-
-	// Generate PR content
-	s.logger.Step("Generating PR content...")
-	title, err := s.ai.GeneratePRTitle(diffAnalysis)
-	if err != nil {
-		s.logger.Error("Failed to generate title: %v", err)
-		return
-	}
-	s.logger.PR("Title: %s", title)
-
-	desc, err := s.ai.GeneratePRDescription(diffAnalysis)
-	if err != nil {
-		s.logger.Error("Failed to generate description: %v", err)
-		return
-	}
-
-	// Add contributing guide context if available
-	if guide != "" {
-		s.logger.Step("Applying contributing guidelines...")
-		desc = fmt.Sprintf("Following repository guidelines:\n\n%s\n\n%s", guide, desc)
-		if s.logger.IsDebug() {
-			s.logger.Debug("Description with guidelines (%d bytes)", len(desc))
-		}
-	}
-
-	// Add commit SHA for reference
-	desc = fmt.Sprintf("%s\n\nCommit: %s", desc, sha)
-
-	// Create PR
-	s.logger.Step("Creating pull request...")
-	pr, err := s.github.CreatePR(context.Background(), owner, repo, title, desc, branch, defaultBranch)
-	if err != nil {
-		s.logger.Error("Failed to create PR: %v", err)
-		return
-	}
-
-	s.logger.Success("Created PR #%d", pr.GetNumber())
-	s.logger.PR("URL: %s", pr.GetHTMLURL())
 }

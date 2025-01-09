@@ -1,21 +1,15 @@
 package main
 
 import (
-	"context"
 	"flag"
-	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
-	"syscall"
-	"time"
 
-	"github.com/saint0x/ggquick/pkg/ai"
-	"github.com/saint0x/ggquick/pkg/github"
-	"github.com/saint0x/ggquick/pkg/hooks"
 	"github.com/saint0x/ggquick/pkg/log"
-	"github.com/saint0x/ggquick/pkg/server"
 )
+
+const serverURL = "https://ggquick.fly.dev"
 
 var (
 	debug = flag.Bool("debug", false, "Enable debug logging")
@@ -35,19 +29,43 @@ func main() {
 	// Handle commands
 	switch args[0] {
 	case "start":
-		startServer(logger)
-
-	case "stop":
-		if err := stopServer(logger); err != nil {
-			logger.Error("Failed to stop server: %v", err)
+		// Verify environment
+		if os.Getenv("GITHUB_TOKEN") == "" {
+			logger.Error("GITHUB_TOKEN environment variable not set")
 			os.Exit(1)
 		}
+
+		if os.Getenv("OPENAI_API_KEY") == "" {
+			logger.Error("OPENAI_API_KEY environment variable not set")
+			os.Exit(1)
+		}
+
+		// Check server health
+		resp, err := http.Get(serverURL + "/health")
+		if err != nil {
+			logger.Error("Failed to connect to server: %v", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			logger.Error("Server is not healthy (status: %d)", resp.StatusCode)
+			os.Exit(1)
+		}
+
+		logger.Success("Connected to ggquick ✨")
+		logger.Info("Listening for Git events...")
+		logger.Info("Press Ctrl+C to stop")
+
+		// Wait for Ctrl+C
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt)
+		<-c
+
+		logger.Info("Shutting down...")
 
 	case "check":
-		if err := checkServer(logger); err != nil {
-			logger.Error("Server status check failed: %v", err)
-			os.Exit(1)
-		}
+		checkRemoteServer(logger, serverURL)
 
 	default:
 		logger.Error("Unknown command: %s", args[0])
@@ -56,178 +74,41 @@ func main() {
 	}
 }
 
-func startServer(logger *log.Logger) {
-	// Check if server is already running
-	pidFile := "/tmp/ggquick.pid"
-	if pid, err := checkPID(pidFile); err == nil {
-		logger.Error("Server is already running (PID: %d)", pid)
-		os.Exit(1)
-	}
-
-	// Save PID
-	pid := os.Getpid()
-	if err := os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", pid)), 0644); err != nil {
-		logger.Error("Failed to save PID: %v", err)
-		os.Exit(1)
-	}
-
-	// Create components
-	aiGen := ai.New(logger)
-	ghClient := github.New(logger)
-	hooksMgr := hooks.New(logger)
-
-	// Create server
-	srv, err := server.New(logger, aiGen, ghClient, hooksMgr)
-	if err != nil {
-		logger.Error("Failed to create server: %v", err)
-		os.Exit(1)
-	}
-
-	// Setup signal handling
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	// Handle signals in a separate goroutine
-	go func() {
-		sig := <-sigCh
-		if logger.IsDebug() {
-			logger.Info("Received signal: %v", sig)
-		}
-		logger.Info("Shutting down server...")
-		cancel()
-
-		// Wait for a second signal for force quit
-		select {
-		case <-sigCh:
-			logger.Warning("Forced shutdown")
-			os.Remove(pidFile)
-			os.Exit(1)
-		case <-time.After(5 * time.Second):
-			logger.Error("Server took too long to stop")
-			os.Remove(pidFile)
-			os.Exit(1)
-		}
-	}()
-
-	// Start server
-	if err := srv.Start(ctx); err != nil {
-		logger.Error("Server error: %v", err)
-		os.Remove(pidFile)
-		os.Exit(1)
-	}
-
-	// Clean up
-	os.Remove(pidFile)
-	os.Exit(0)
-}
-
-func stopServer(logger *log.Logger) error {
-	pidFile := "/tmp/ggquick.pid"
-	pid, err := checkPID(pidFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			logger.Warning("No server is currently running")
-			return nil
-		}
-		return fmt.Errorf("failed to read PID file: %w", err)
-	}
-
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return fmt.Errorf("failed to find process: %w", err)
-	}
-
-	if err := process.Signal(syscall.SIGTERM); err != nil {
-		if err.Error() == "os: process already finished" {
-			logger.Warning("Server process was not running")
-			os.Remove(pidFile)
-			return nil
-		}
-		return fmt.Errorf("failed to stop server: %w", err)
-	}
-
-	os.Remove(pidFile)
-	logger.Success("Server stopped successfully (PID: %d)", pid)
-	return nil
-}
-
-func checkServer(logger *log.Logger) error {
-	pidFile := "/tmp/ggquick.pid"
-	pid, err := checkPID(pidFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			logger.Warning("No server is running")
-			return nil
-		}
-		return fmt.Errorf("failed to read PID file: %w", err)
-	}
-
-	// Check if process is running
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		os.Remove(pidFile)
-		logger.Warning("No server is running")
-		return nil
-	}
-
-	// Check if process responds
-	if err := process.Signal(syscall.Signal(0)); err != nil {
-		os.Remove(pidFile)
-		logger.Warning("No server is running")
-		return nil
-	}
-
-	// Read port
-	portFile := fmt.Sprintf("%s/.ggquick/port", os.Getenv("HOME"))
-	portBytes, err := os.ReadFile(portFile)
-	if err != nil {
-		return fmt.Errorf("failed to read port file: %w", err)
-	}
-	port := string(portBytes)
-
-	logger.Success("Server is running:")
-	logger.Info("- Process ID: %d", pid)
-	logger.Info("- Port: %s", port)
-	logger.Info("- Webhook URL: http://localhost:%s/push", port)
-	return nil
-}
-
-func checkPID(pidFile string) (int, error) {
-	data, err := os.ReadFile(pidFile)
-	if err != nil {
-		return 0, err
-	}
-
-	pid, err := strconv.Atoi(string(data))
-	if err != nil {
-		return 0, fmt.Errorf("invalid PID file content")
-	}
-
-	return pid, nil
-}
-
 func printUsage(logger *log.Logger) {
 	logger.PR("ggquick 🚀")
 	logger.Info("AI-powered GitHub PR automation")
 	logger.Info("")
 	logger.Step("Commands:")
-	logger.Success("  start     Start the automation server")
-	logger.Success("  stop      Stop the server")
-	logger.Success("  check     Show server status")
+	logger.Success("  start     Start listening for Git events")
+	logger.Success("  check     Check server status")
 	logger.Info("")
 	logger.Step("Options:")
 	logger.Info("  --debug    Enable verbose logging")
 	logger.Info("")
 	logger.Step("Environment:")
-	logger.Info("  GITHUB_TOKEN         GitHub token")
-	logger.Info("  GITHUB_REPOSITORY    Target repository (e.g., user/repo)")
-	logger.Info("  GGQUICK_PORT        Server port (default: 8080)")
+	logger.Info("  GITHUB_TOKEN      GitHub token")
+	logger.Info("  OPENAI_API_KEY    OpenAI API key")
 	logger.Info("")
 	logger.Step("Quick Start:")
-	logger.Info("  export GITHUB_TOKEN=<token>")
-	logger.Info("  export GITHUB_REPOSITORY=user/repo")
-	logger.Info("  ggquick start")
+	logger.Info("  1. Create .env file with:")
+	logger.Info("     GITHUB_TOKEN=<token>")
+	logger.Info("     OPENAI_API_KEY=<key>")
+	logger.Info("  2. Run: ggquick start")
+}
+
+func checkRemoteServer(logger *log.Logger, url string) {
+	resp, err := http.Get(url + "/health")
+	if err != nil {
+		logger.Error("Failed to connect to server: %v", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		logger.Success("Connected to ggquick ✨")
+		logger.Info("Ready to handle Git events")
+	} else {
+		logger.Error("Server returned status: %d", resp.StatusCode)
+		os.Exit(1)
+	}
 }

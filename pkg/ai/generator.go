@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,22 @@ import (
 )
 
 const openAIEndpoint = "https://api.openai.com/v1/chat/completions"
+
+// SystemPrompts holds the prompts from sysprompt.json
+type SystemPrompts struct {
+	PRTitle struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	} `json:"pr_title"`
+	PRDescription struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	} `json:"pr_description"`
+	CodeAnalysis struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	} `json:"code_analysis"`
+}
 
 // HTTPClient interface for mocking http.Client
 type HTTPClient interface {
@@ -26,6 +43,7 @@ type Generator struct {
 	logger     *log.Logger
 	cache      sync.Map // Cache for analysis results
 	httpClient HTTPClient
+	prompts    *SystemPrompts
 }
 
 // Analysis represents code analysis results
@@ -38,10 +56,11 @@ type Analysis struct {
 
 // DiffAnalysis represents code changes
 type DiffAnalysis struct {
-	Files     []string          `json:"files"`
-	Additions int               `json:"additions"`
-	Deletions int               `json:"deletions"`
-	Changes   map[string]Change `json:"changes"`
+	Files             []string          `json:"files"`
+	Additions         int               `json:"additions"`
+	Deletions         int               `json:"deletions"`
+	Changes           map[string]Change `json:"changes"`
+	ContributingGuide string            `json:"contributing_guide,omitempty"`
 }
 
 // Change represents a file change
@@ -76,10 +95,40 @@ type openAIResponse struct {
 
 // New creates a new Generator instance
 func New(logger *log.Logger) *Generator {
-	return &Generator{
+	g := &Generator{
 		logger:     logger,
 		httpClient: http.DefaultClient,
 	}
+
+	// Load system prompts
+	if err := g.loadSystemPrompts(); err != nil && logger.IsDebug() {
+		logger.Warning("Failed to load system prompts: %v", err)
+	}
+
+	return g
+}
+
+// loadSystemPrompts loads prompts from sysprompt.json
+func (g *Generator) loadSystemPrompts() error {
+	// Try to find sysprompt.json in the workspace root
+	workspaceRoot := os.Getenv("WORKSPACE_ROOT")
+	if workspaceRoot == "" {
+		// Try to find it relative to the current directory
+		workspaceRoot = "."
+	}
+
+	data, err := os.ReadFile(filepath.Join(workspaceRoot, "sysprompt.json"))
+	if err != nil {
+		return fmt.Errorf("failed to read sysprompt.json: %w", err)
+	}
+
+	var prompts SystemPrompts
+	if err := json.Unmarshal(data, &prompts); err != nil {
+		return fmt.Errorf("failed to parse sysprompt.json: %w", err)
+	}
+
+	g.prompts = &prompts
+	return nil
 }
 
 // SetHTTPClient sets a custom HTTP client (useful for testing)
@@ -89,8 +138,18 @@ func (g *Generator) SetHTTPClient(client HTTPClient) {
 
 // GeneratePRTitle generates a PR title based on code changes and contributing guidelines
 func (g *Generator) GeneratePRTitle(diff DiffAnalysis) (string, error) {
-	systemPrompt := "You are a PR title generator. Generate a concise, descriptive title."
+	var systemPrompt string
+	if g.prompts != nil {
+		systemPrompt = g.prompts.PRTitle.Content
+	} else {
+		systemPrompt = "You are a PR title generator. Generate a concise, descriptive title that follows contributing guidelines."
+	}
+
+	// Include contributing guidelines in the user prompt
 	userPrompt := fmt.Sprintf("Generate a PR title for these changes:\n%+v", diff)
+	if diff.ContributingGuide != "" {
+		userPrompt = fmt.Sprintf("Contributing Guidelines:\n%s\n\n%s", diff.ContributingGuide, userPrompt)
+	}
 
 	title, err := g.generateWithAI(context.Background(), systemPrompt, userPrompt)
 	if err != nil {
@@ -102,8 +161,18 @@ func (g *Generator) GeneratePRTitle(diff DiffAnalysis) (string, error) {
 
 // GeneratePRDescription generates a PR description based on code changes and contributing guidelines
 func (g *Generator) GeneratePRDescription(diff DiffAnalysis) (string, error) {
-	systemPrompt := "You are a PR description generator. Generate a clear, detailed description."
+	var systemPrompt string
+	if g.prompts != nil {
+		systemPrompt = g.prompts.PRDescription.Content
+	} else {
+		systemPrompt = "You are a PR description generator. Generate a clear, detailed description that follows contributing guidelines."
+	}
+
+	// Include contributing guidelines in the user prompt
 	userPrompt := fmt.Sprintf("Generate a PR description for these changes:\n%+v", diff)
+	if diff.ContributingGuide != "" {
+		userPrompt = fmt.Sprintf("Contributing Guidelines:\n%s\n\n%s", diff.ContributingGuide, userPrompt)
+	}
 
 	desc, err := g.generateWithAI(context.Background(), systemPrompt, userPrompt)
 	if err != nil {
