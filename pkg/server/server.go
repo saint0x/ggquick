@@ -75,6 +75,7 @@ type GitHubClient interface {
 	GetBranches(ctx context.Context, owner, repo string) ([]*github.Branch, error)
 	GetPRs(ctx context.Context, owner, repo string, limit int) ([]*github.PullRequest, error)
 	GetDiff(ctx context.Context, owner, repo, base, head string) (string, error)
+	GetCommitMessage(ctx context.Context, owner, repo, sha string) (string, error)
 }
 
 // HooksManager interface for git hooks
@@ -332,16 +333,39 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	diffURL, diffErr := s.github.GetDiff(r.Context(), "saint0x", "z-sample-repo", defaultBranch, branchName)
 	if diffErr != nil {
 		s.logger.Warning("⚠️ Could not get diff against %s: %v", defaultBranch, diffErr)
-		s.logger.Loading("🔍 Analyzing commit directly...")
+		s.logger.Loading("🔍 Analyzing commit message...")
 
-		// Analyze the commit itself
-		commitAnalysis, err := s.ai.AnalyzeCommit(payload.SHA)
+		// Get the commit message from GitHub
+		commitMsg, err := s.github.GetCommitMessage(r.Context(), "saint0x", "z-sample-repo", payload.SHA)
+		if err != nil {
+			s.logger.Warning("⚠️ Failed to get commit message: %v", err)
+			commitMsg = "feat: improve resilience in PR generation" // Default if we can't get the real message
+		}
+
+		// Analyze the commit message
+		commitAnalysis, err := s.ai.AnalyzeCommit(commitMsg)
 		if err != nil {
 			s.logger.Warning("⚠️ Failed to analyze commit: %v", err)
+			// Use default values from commit message format
+			if strings.HasPrefix(commitMsg, "feat") {
+				analysis.Changes[branchName] = ai.Change{
+					Type:      "feature",
+					Component: "core",
+				}
+			} else if strings.HasPrefix(commitMsg, "fix") {
+				analysis.Changes[branchName] = ai.Change{
+					Type:      "fix",
+					Component: "core",
+				}
+			} else {
+				analysis.Changes[branchName] = ai.Change{
+					Type:      "other",
+					Component: "core",
+				}
+			}
 		} else {
 			s.logger.Success("✅ Analyzed commit successfully")
 			analysis.Changes[branchName] = ai.Change{
-				Path:      "",
 				Type:      commitAnalysis.Type,
 				Component: commitAnalysis.Component,
 			}

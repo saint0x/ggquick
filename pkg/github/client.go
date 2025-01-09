@@ -180,3 +180,13 @@ func (c *Client) GetDiff(ctx context.Context, owner, repo, base, head string) (s
 
 	return comp.GetDiffURL(), nil
 }
+
+// GetCommitMessage gets the commit message for a SHA
+func (c *Client) GetCommitMessage(ctx context.Context, owner, repo, sha string) (string, error) {
+	commit, _, err := c.client.Git.GetCommit(ctx, owner, repo, sha)
+	if err != nil {
+		return "", fmt.Errorf("failed to get commit: %w", err)
+	}
+
+	return commit.GetMessage(), nil
+}
