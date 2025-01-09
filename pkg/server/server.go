@@ -317,48 +317,54 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	s.logger.Loading("🔍 Getting default branch...")
 	defaultBranch, err := s.github.GetDefaultBranch(r.Context(), "saint0x", "z-sample-repo")
 	if err != nil {
-		s.logger.Error("❌ Failed to get default branch: %v", err)
-		http.Error(w, "Failed to get default branch", http.StatusInternalServerError)
-		return
+		s.logger.Warning("⚠️ Failed to get default branch: %v", err)
+		defaultBranch = "main" // Fallback to main if we can't get default branch
 	}
 	s.logger.Debug("✅ Default branch is: %s", defaultBranch)
 
-	// Get diff for analysis
-	s.logger.Loading("📝 Fetching diff from GitHub...")
-	diffURL, err := s.github.GetDiff(r.Context(), "saint0x", "z-sample-repo", defaultBranch, branchName)
-	if err != nil {
-		s.logger.Error("❌ Failed to get diff: %v", err)
-		http.Error(w, "Failed to get diff", http.StatusInternalServerError)
-		return
-	}
-	s.logger.Debug("✅ Got diff URL: %s", diffURL)
+	// Initialize analysis
+	var analysis ai.DiffAnalysis
+	analysis.Files = []string{}
+	analysis.Changes = make(map[string]ai.Change)
 
-	// Get contributing guide
+	// Try to get diff first
+	s.logger.Loading("📝 Attempting to get diff from GitHub...")
+	diffURL, diffErr := s.github.GetDiff(r.Context(), "saint0x", "z-sample-repo", defaultBranch, branchName)
+	if diffErr != nil {
+		s.logger.Warning("⚠️ Could not get diff against %s: %v", defaultBranch, diffErr)
+		s.logger.Loading("🔍 Analyzing commit directly...")
+
+		// Analyze the commit itself
+		commitAnalysis, err := s.ai.AnalyzeCommit(payload.SHA)
+		if err != nil {
+			s.logger.Warning("⚠️ Failed to analyze commit: %v", err)
+		} else {
+			s.logger.Success("✅ Analyzed commit successfully")
+			analysis.Changes[branchName] = ai.Change{
+				Path:      "",
+				Type:      commitAnalysis.Type,
+				Component: commitAnalysis.Component,
+			}
+		}
+	} else {
+		s.logger.Success("✅ Got diff URL: %s", diffURL)
+		// Add diff information to analysis
+		analysis.Changes[branchName] = ai.Change{
+			Path:      diffURL,
+			Type:      "feature", // This could be improved by analyzing the diff
+			Component: branchName,
+		}
+	}
+
+	// Try to get contributing guide, but don't fail if not found
+	s.logger.Loading("📚 Checking for contributing guide...")
 	guide, err := s.github.GetContributingGuide(r.Context(), "saint0x", "z-sample-repo")
 	if err != nil {
 		s.logger.Warning("⚠️ No contributing guide found: %v", err)
+	} else if guide != "" {
+		s.logger.Success("✅ Found contributing guide")
+		analysis.ContributingGuide = guide
 	}
-	if guide != "" {
-		s.logger.Debug("✅ Found contributing guide")
-	}
-
-	// Analyze diff
-	s.logger.Loading("🔍 Preparing diff analysis...")
-	analysis := ai.DiffAnalysis{
-		Files: []string{},
-		Changes: map[string]ai.Change{
-			branchName: {
-				Path:      "",
-				Added:     []string{},
-				Type:      "feature",
-				Component: branchName,
-			},
-		},
-		ContributingGuide: guide,
-		Additions:         0,
-		Deletions:         0,
-	}
-	s.logger.Debug("✅ Diff analysis prepared")
 
 	// Generate PR title and description
 	s.logger.Loading("🤖 Generating PR title with AI...")
@@ -368,7 +374,7 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to generate PR title", http.StatusInternalServerError)
 		return
 	}
-	s.logger.Debug("✅ Generated PR title: %s", title)
+	s.logger.Success("✅ Generated PR title: %s", title)
 
 	s.logger.Loading("🤖 Generating PR description with AI...")
 	desc, err := s.ai.GeneratePRDescription(analysis)
@@ -377,7 +383,7 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to generate PR description", http.StatusInternalServerError)
 		return
 	}
-	s.logger.Debug("✅ Generated PR description")
+	s.logger.Success("✅ Generated PR description")
 
 	// Create PR
 	s.logger.Loading("📦 Creating pull request...")
@@ -385,8 +391,8 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		Title:       title,
 		Description: desc,
 		Branch:      branchName,
-		BaseBranch:  "main",
-		Labels:      []string{"feature"},
+		BaseBranch:  defaultBranch,                               // Use the default branch we got earlier
+		Labels:      []string{analysis.Changes[branchName].Type}, // Use the type from our analysis
 	})
 	if err != nil {
 		s.logger.Error("❌ Failed to create PR: %v", err)
@@ -396,7 +402,7 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	s.logger.Success("✨ Pull request created successfully!")
 	s.logger.Info("🔗 PR URL: %s", pr.GetHTMLURL())
 	s.logger.Info("📝 Title: %s", title)
-	s.logger.Info("🏷️  Labels: feature")
+	s.logger.Info("🏷️  Labels: %s", analysis.Changes[branchName].Type)
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("ok"))
