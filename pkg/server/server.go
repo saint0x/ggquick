@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/go-github/v57/github"
 	"github.com/saint0x/ggquick/pkg/ai"
@@ -71,6 +73,13 @@ func New(logger *log.Logger, ai AIGenerator, gh GitHubClient, hooks HooksManager
 		return nil, fmt.Errorf("hooks manager is required")
 	}
 
+	if logger.IsDebug() {
+		logger.Info("Initializing server with components:")
+		logger.Info("- AI Generator: ✓")
+		logger.Info("- GitHub Client: ✓")
+		logger.Info("- Hooks Manager: ✓")
+	}
+
 	return &Server{
 		logger: logger,
 		ai:     ai,
@@ -84,41 +93,89 @@ func (s *Server) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.logger.IsDebug() {
+		s.logger.Info("Starting server initialization...")
+	}
+
 	// Create server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/push", s.handlePush)
+	if s.logger.IsDebug() {
+		s.logger.Info("Registered webhook handler at /push")
+	}
 
 	// Get port from env or use default
 	port := os.Getenv("GGQUICK_PORT")
 	if port == "" {
 		port = "8080"
+		if s.logger.IsDebug() {
+			s.logger.Info("Using default port: %s", port)
+		}
+	} else if s.logger.IsDebug() {
+		s.logger.Info("Using configured port: %s", port)
 	}
 
+	// Try to find an available port
+	listener, err := s.findAvailablePort(port)
+	if err != nil {
+		return fmt.Errorf("failed to find available port: %w", err)
+	}
+	actualPort := listener.Addr().(*net.TCPAddr).Port
+
 	// Save port for hooks
-	if err := os.MkdirAll(filepath.Join(os.Getenv("HOME"), ".ggquick"), 0755); err != nil {
+	configDir := filepath.Join(os.Getenv("HOME"), ".ggquick")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		listener.Close()
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(os.Getenv("HOME"), ".ggquick/port"), []byte(port), 0644); err != nil {
+
+	portFile := filepath.Join(configDir, "port")
+	if err := os.WriteFile(portFile, []byte(fmt.Sprintf("%d", actualPort)), 0644); err != nil {
+		listener.Close()
 		return fmt.Errorf("failed to save port: %w", err)
 	}
 
 	s.srv = &http.Server{
-		Addr:    ":" + port,
 		Handler: mux,
 	}
 
-	// Start server
+	// Start server using the existing listener
 	go func() {
-		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.srv.Serve(listener); err != nil && err != http.ErrServerClosed {
 			s.logger.Error("Server error: %v", err)
 		}
 	}()
 
-	s.logger.Success("Server started on port %s", port)
+	s.logger.Success("Server is running on port %d", actualPort)
+	if s.logger.IsDebug() {
+		s.logger.Info("Webhook URL: http://localhost:%d/push", actualPort)
+		s.logger.Info("Press Ctrl+C to stop")
+	}
 
 	// Wait for context cancellation
 	<-ctx.Done()
 	return s.Stop()
+}
+
+// findAvailablePort tries to find an available port starting from the given port
+func (s *Server) findAvailablePort(startPort string) (net.Listener, error) {
+	// Try the specified port first
+	listener, err := net.Listen("tcp", ":"+startPort)
+	if err == nil {
+		return listener, nil
+	}
+
+	if s.logger.IsDebug() {
+		s.logger.Info("Port %s is in use, searching for available port...", startPort)
+	}
+
+	// Try to find a random available port
+	listener, err = net.Listen("tcp", ":0")
+	if err != nil {
+		return nil, fmt.Errorf("failed to find available port: %w", err)
+	}
+
+	return listener, nil
 }
 
 // Stop stops the server
@@ -127,10 +184,16 @@ func (s *Server) Stop() error {
 	defer s.mu.Unlock()
 
 	if s.srv != nil {
-		if err := s.srv.Shutdown(context.Background()); err != nil {
+		// Create a timeout context for shutdown
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := s.srv.Shutdown(ctx); err != nil {
+			s.logger.Error("Failed to stop server: %v", err)
 			return fmt.Errorf("failed to stop server: %w", err)
 		}
 		s.srv = nil
+		s.logger.Success("Server stopped")
 	}
 
 	return nil
@@ -138,37 +201,51 @@ func (s *Server) Stop() error {
 
 // handlePush handles push events
 func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
+	if s.logger.IsDebug() {
+		s.logger.Info("Received webhook request from %s", r.RemoteAddr)
+	}
+
 	if r.Method != http.MethodPost {
+		s.logger.Warning("Invalid method %s from %s", r.Method, r.RemoteAddr)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	// Parse request body
 	var ref, sha string
-	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+	contentType := r.Header.Get("Content-Type")
+
+	if strings.HasPrefix(contentType, "application/json") {
 		var event struct {
 			Ref    string `json:"ref"`
 			After  string `json:"after"`
 			Before string `json:"before"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+			s.logger.Error("Failed to decode JSON payload: %v", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		ref = event.Ref
 		sha = event.After
+		if s.logger.IsDebug() {
+			s.logger.Info("Parsed JSON webhook: ref=%s, sha=%s", ref, sha)
+		}
 	} else {
-		// Parse plain text format: <sha>\n<message>\n<author>
 		scanner := bufio.NewScanner(r.Body)
 		if scanner.Scan() {
 			sha = scanner.Text()
 		}
-		ref = "refs/heads/" + sha // Use commit hash as branch name
+		ref = "refs/heads/" + sha
+		if s.logger.IsDebug() {
+			s.logger.Info("Parsed text webhook: sha=%s", sha)
+		}
 	}
 
 	// Get repository info from environment
 	repoURL := os.Getenv("GITHUB_REPOSITORY")
 	if repoURL == "" {
+		s.logger.Error("GITHUB_REPOSITORY environment variable not set")
 		http.Error(w, "GITHUB_REPOSITORY environment variable not set", http.StatusInternalServerError)
 		return
 	}
@@ -181,38 +258,56 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 
 // createPR generates and creates a pull request
 func (s *Server) createPR(repoFullName string, ref, sha string) {
-	owner, repo, _ := s.github.ParseRepoURL("https://github.com/" + repoFullName)
+	s.logger.Step("Starting PR creation...")
+
+	// Parse repository info
+	owner, repo, err := s.github.ParseRepoURL("https://github.com/" + repoFullName)
+	if err != nil {
+		s.logger.Error("Failed to parse repository URL: %v", err)
+		return
+	}
+	s.logger.Info("Repository: %s/%s", owner, repo)
+
+	// Get branch name
 	branch := ref[11:] // Remove "refs/heads/"
+	s.logger.Branch("Branch: %s", branch)
 
 	// Get default branch
+	s.logger.Step("Fetching repository info...")
 	defaultBranch, err := s.github.GetDefaultBranch(context.Background(), owner, repo)
 	if err != nil {
 		s.logger.Error("Failed to get default branch: %v", err)
 		return
 	}
+	s.logger.Branch("Default branch: %s", defaultBranch)
 
 	// Get contributing guide
+	s.logger.Step("Checking contributing guidelines...")
 	guide, err := s.github.GetContributingGuide(context.Background(), owner, repo)
 	if err != nil {
 		s.logger.Warning("No contributing guide found: %v", err)
+	} else {
+		s.logger.Success("Found contributing guidelines (%d bytes)", len(guide))
 	}
 
 	// Get diff and analyze changes
+	s.logger.Step("Analyzing changes...")
 	diffURL, err := s.github.GetDiff(context.Background(), owner, repo, defaultBranch, branch)
 	if err != nil {
 		s.logger.Error("Failed to get diff: %v", err)
 		return
 	}
+	s.logger.Diff("Changes between %s...%s", defaultBranch, branch)
 
-	// Convert diff to analysis format
+	// Prepare diff analysis
 	diffAnalysis := ai.DiffAnalysis{
 		Files:     []string{branch},
-		Additions: 0, // We don't parse these from the diff text
+		Additions: 0,
 		Deletions: 0,
 		Changes: map[string]ai.Change{
 			branch: {
 				Path:      branch,
-				Type:      "feature", // Default type
+				Type:      "feature",
 				Component: branch,
 				Modified:  []string{fmt.Sprintf("Diff URL: %s", diffURL)},
 			},
@@ -220,11 +315,13 @@ func (s *Server) createPR(repoFullName string, ref, sha string) {
 	}
 
 	// Generate PR content
+	s.logger.Step("Generating PR content...")
 	title, err := s.ai.GeneratePRTitle(diffAnalysis)
 	if err != nil {
 		s.logger.Error("Failed to generate title: %v", err)
 		return
 	}
+	s.logger.PR("Title: %s", title)
 
 	desc, err := s.ai.GeneratePRDescription(diffAnalysis)
 	if err != nil {
@@ -234,15 +331,24 @@ func (s *Server) createPR(repoFullName string, ref, sha string) {
 
 	// Add contributing guide context if available
 	if guide != "" {
-		desc = fmt.Sprintf("Following contributing guidelines:\n\n%s\n\n%s", guide, desc)
+		s.logger.Step("Applying contributing guidelines...")
+		desc = fmt.Sprintf("Following repository guidelines:\n\n%s\n\n%s", guide, desc)
+		if s.logger.IsDebug() {
+			s.logger.Debug("Description with guidelines (%d bytes)", len(desc))
+		}
 	}
 
+	// Add commit SHA for reference
+	desc = fmt.Sprintf("%s\n\nCommit: %s", desc, sha)
+
 	// Create PR
+	s.logger.Step("Creating pull request...")
 	pr, err := s.github.CreatePR(context.Background(), owner, repo, title, desc, branch, defaultBranch)
 	if err != nil {
 		s.logger.Error("Failed to create PR: %v", err)
 		return
 	}
 
-	s.logger.Success("Created PR #%d: %s", pr.GetNumber(), pr.GetHTMLURL())
+	s.logger.Success("Created PR #%d", pr.GetNumber())
+	s.logger.PR("URL: %s", pr.GetHTMLURL())
 }

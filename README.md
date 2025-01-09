@@ -15,11 +15,10 @@ AI-powered GitHub PR automation. Automatically creates well-formatted pull reque
 # Clone and setup
 git clone https://github.com/saint0x/ggquick.git
 cd ggquick
-cp .env.example .env
 
-# Add your tokens to .env
-# - GitHub token (with repo scope): https://github.com/settings/tokens
-# - OpenAI API key: https://platform.openai.com/account/api-keys
+# Add your GitHub token to the environment
+export GITHUB_TOKEN=your_github_token
+export GITHUB_REPOSITORY=username/repo
 
 # Run the installer
 chmod +x build.sh && ./build.sh
@@ -27,26 +26,31 @@ chmod +x build.sh && ./build.sh
 
 ## Usage
 
-Start the background server:
+Start the server:
 ```bash
 ggquick start
 ```
 
-That's it! The server will:
-1. Install git hooks in your repositories
-2. Watch for new branch pushes
-3. Automatically create PRs with AI-generated content
-4. Follow repository contributing guidelines
+Check server status:
+```bash
+ggquick check
+```
 
 Stop the server:
 ```bash
 ggquick stop
 ```
 
-### Debug Mode
+Enable debug logging:
 ```bash
-ggquick start --debug  # Verbose output
+ggquick start --debug
 ```
+
+## Environment Variables
+
+- `GITHUB_TOKEN`: Required. GitHub personal access token with repo scope
+- `GITHUB_REPOSITORY`: Required. Repository to create PRs in (e.g., username/repo)
+- `GGQUICK_PORT`: Optional. Server port (default: 8080)
 
 ## How it Works
 
@@ -57,11 +61,21 @@ ggquick start --debug  # Verbose output
 
 ## Troubleshooting
 
-If the automation isn't working:
-1. Check your tokens: `echo $GITHUB_TOKEN && echo $OPENAI_API_KEY`
-2. Verify the server is running: `ps aux | grep ggquick`
-3. Check git hooks: `ls -la .git/hooks/`
-4. Try restarting: `ggquick stop && ggquick start`
+1. Check server status:
+   ```bash
+   ggquick check
+   ```
+
+2. If server isn't running:
+   ```bash
+   ggquick start --debug  # Start with verbose logging
+   ```
+
+3. If server is stuck:
+   ```bash
+   ggquick stop
+   ggquick start
+   ```
 
 ## License
 

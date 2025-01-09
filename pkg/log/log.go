@@ -143,3 +143,8 @@ func (l *Logger) Diff(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	fmt.Printf("%s%s%s%s\n", yellow, diffEmoji, formatMessage(msg), reset)
 }
+
+// IsDebug returns whether debug logging is enabled
+func (l *Logger) IsDebug() bool {
+	return l.debug
+}
