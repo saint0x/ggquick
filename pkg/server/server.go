@@ -2,8 +2,11 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -275,18 +278,126 @@ func (s *Server) Stop() error {
 
 // handlePush handles push events
 func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
-	s.logger.Loading("Processing push event...")
-	if s.logger.IsDebug() {
-		s.logger.Debug("Push event received from %s", r.RemoteAddr)
-	}
+	s.logger.Loading("🔄 Processing push event...")
+	s.logger.Debug("📥 Push event received from %s", r.RemoteAddr)
 
+	// Validate method
 	if r.Method != http.MethodPost {
-		s.logger.Error("Invalid method: %s", r.Method)
+		s.logger.Error("❌ Invalid method: %s", r.Method)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	s.logger.Success("Push event processed")
+	// Parse request body
+	var payload struct {
+		Ref string `json:"ref"`
+		SHA string `json:"sha"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		s.logger.Error("❌ Failed to decode payload: %v", err)
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	s.logger.Debug("✅ Payload decoded: ref=%s, sha=%s", payload.Ref, payload.SHA)
+
+	// Extract branch name from ref
+	branchName := strings.TrimPrefix(payload.Ref, "refs/heads/")
+	s.logger.Debug("🔍 Branch name extracted: %s", branchName)
+
+	// Initialize GitHub client
+	s.logger.Loading("🔐 Initializing GitHub client...")
+	if err := s.hooks.InitGitHub(os.Getenv("GITHUB_TOKEN"), "saint0x", "z-sample-repo"); err != nil {
+		s.logger.Error("❌ Failed to initialize GitHub client: %v", err)
+		http.Error(w, "Failed to initialize GitHub", http.StatusInternalServerError)
+		return
+	}
+	s.logger.Debug("✅ GitHub client initialized with token")
+
+	// Get default branch
+	s.logger.Loading("🔍 Getting default branch...")
+	defaultBranch, err := s.github.GetDefaultBranch(r.Context(), "saint0x", "z-sample-repo")
+	if err != nil {
+		s.logger.Error("❌ Failed to get default branch: %v", err)
+		http.Error(w, "Failed to get default branch", http.StatusInternalServerError)
+		return
+	}
+	s.logger.Debug("✅ Default branch is: %s", defaultBranch)
+
+	// Get diff for analysis
+	s.logger.Loading("📝 Fetching diff from GitHub...")
+	diffURL, err := s.github.GetDiff(r.Context(), "saint0x", "z-sample-repo", defaultBranch, branchName)
+	if err != nil {
+		s.logger.Error("❌ Failed to get diff: %v", err)
+		http.Error(w, "Failed to get diff", http.StatusInternalServerError)
+		return
+	}
+	s.logger.Debug("✅ Got diff URL: %s", diffURL)
+
+	// Get contributing guide
+	guide, err := s.github.GetContributingGuide(r.Context(), "saint0x", "z-sample-repo")
+	if err != nil {
+		s.logger.Warning("⚠️ No contributing guide found: %v", err)
+	}
+	if guide != "" {
+		s.logger.Debug("✅ Found contributing guide")
+	}
+
+	// Analyze diff
+	s.logger.Loading("🔍 Preparing diff analysis...")
+	analysis := ai.DiffAnalysis{
+		Files: []string{},
+		Changes: map[string]ai.Change{
+			branchName: {
+				Path:      "",
+				Added:     []string{},
+				Type:      "feature",
+				Component: branchName,
+			},
+		},
+		ContributingGuide: guide,
+		Additions:         0,
+		Deletions:         0,
+	}
+	s.logger.Debug("✅ Diff analysis prepared")
+
+	// Generate PR title and description
+	s.logger.Loading("🤖 Generating PR title with AI...")
+	title, err := s.ai.GeneratePRTitle(analysis)
+	if err != nil {
+		s.logger.Error("❌ Failed to generate PR title: %v", err)
+		http.Error(w, "Failed to generate PR title", http.StatusInternalServerError)
+		return
+	}
+	s.logger.Debug("✅ Generated PR title: %s", title)
+
+	s.logger.Loading("🤖 Generating PR description with AI...")
+	desc, err := s.ai.GeneratePRDescription(analysis)
+	if err != nil {
+		s.logger.Error("❌ Failed to generate PR description: %v", err)
+		http.Error(w, "Failed to generate PR description", http.StatusInternalServerError)
+		return
+	}
+	s.logger.Debug("✅ Generated PR description")
+
+	// Create PR
+	s.logger.Loading("📦 Creating pull request...")
+	pr, err := s.hooks.CreatePullRequest(r.Context(), &hooks.PullRequestOptions{
+		Title:       title,
+		Description: desc,
+		Branch:      branchName,
+		BaseBranch:  "main",
+		Labels:      []string{"feature"},
+	})
+	if err != nil {
+		s.logger.Error("❌ Failed to create PR: %v", err)
+		http.Error(w, "Failed to create PR", http.StatusInternalServerError)
+		return
+	}
+	s.logger.Success("✨ Pull request created successfully!")
+	s.logger.Info("🔗 PR URL: %s", pr.GetHTMLURL())
+	s.logger.Info("📝 Title: %s", title)
+	s.logger.Info("🏷️  Labels: feature")
+
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("ok"))
 }
