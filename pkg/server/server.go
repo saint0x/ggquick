@@ -101,6 +101,7 @@ type Server struct {
 	srv     *http.Server
 	mu      sync.RWMutex
 	limiter *RateLimiter
+	config  *Config // Store config in memory
 }
 
 // New creates a new server instance
@@ -138,60 +139,37 @@ func New(logger *log.Logger, ai AIGenerator, gh GitHubClient, hooks HooksManager
 	}, nil
 }
 
-// loadConfig loads configuration from the installation directory
-func loadConfig() (*Config, error) {
-	// Config file is always in /usr/local/bin where the binary is installed
-	configPath := "/usr/local/bin/ggquick.json"
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
+// handleConfig handles setting the repository configuration
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
 
 	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
 	}
 
 	// Parse owner and name from URL if not set
 	if config.Owner == "" || config.Name == "" {
 		parts := strings.Split(strings.TrimSuffix(config.RepoURL, ".git"), "/")
 		if len(parts) < 2 {
-			return nil, fmt.Errorf("invalid repository URL format")
+			http.Error(w, "Invalid repository URL format", http.StatusBadRequest)
+			return
 		}
 		config.Owner = parts[len(parts)-2]
 		config.Name = parts[len(parts)-1]
 	}
 
-	return &config, nil
-}
+	// Store config in memory
+	s.mu.Lock()
+	s.config = &config
+	s.mu.Unlock()
 
-// SaveConfig saves the current configuration
-func SaveConfig(repoURL string) error {
-	// Parse owner and name from URL
-	parts := strings.Split(strings.TrimSuffix(repoURL, ".git"), "/")
-	if len(parts) < 2 {
-		return fmt.Errorf("invalid repository URL format")
-	}
-
-	config := Config{
-		RepoURL: repoURL,
-		Owner:   parts[len(parts)-2],
-		Name:    parts[len(parts)-1],
-	}
-
-	// Marshal config
-	data, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
-	}
-
-	// Save to /usr/local/bin where binary is installed
-	configPath := "/usr/local/bin/ggquick.json"
-	if err := os.WriteFile(configPath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write config file: %w", err)
-	}
-
-	return nil
+	s.logger.Success("Repository configured: %s", config.RepoURL)
+	w.WriteHeader(http.StatusOK)
 }
 
 // rateLimit middleware applies rate limiting
@@ -250,7 +228,10 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	})
 
-	// Add rate-limited routes
+	// Add config endpoint
+	mux.HandleFunc("/config", s.rateLimit(s.handleConfig))
+
+	// Add push endpoint
 	mux.HandleFunc("/push", s.rateLimit(s.handlePush))
 
 	s.srv = &http.Server{
@@ -349,10 +330,13 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Load config when we need it
-	config, err := loadConfig()
-	if err != nil {
-		s.logger.Error("❌ Failed to load config: %v", err)
+	// Check if repository is configured
+	s.mu.RLock()
+	config := s.config
+	s.mu.RUnlock()
+
+	if config == nil {
+		s.logger.Error("❌ Repository not configured")
 		http.Error(w, "Repository not configured. Please run 'ggquick start <repository-url>' first", http.StatusBadRequest)
 		return
 	}
