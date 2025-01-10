@@ -17,6 +17,14 @@ print_status() {
     echo -e "${color}${symbol} ${message}${NC}"
 }
 
+# Function to quietly remove old build
+cleanup_old_build() {
+    local binary="/usr/local/bin/ggquick"
+    if [ -f "$binary" ]; then
+        sudo rm "$binary" 2>/dev/null || true
+    fi
+}
+
 # Check prerequisites
 print_status $BLUE $INFO "Checking prerequisites..."
 
@@ -56,11 +64,8 @@ for var in "${REQUIRED_VARS[@]}"; do
 done
 print_status $GREEN $CHECK "Required environment variables verified"
 
-# Clean previous build
-print_status $BLUE $INFO "Cleaning previous build..."
-if [ -f "/usr/local/bin/ggquick" ]; then
-    sudo rm /usr/local/bin/ggquick
-fi
+# Quietly clean previous build
+cleanup_old_build
 
 # Download dependencies
 print_status $BLUE $INFO "Downloading dependencies..."
@@ -95,10 +100,8 @@ fi
 print_status $GREEN $CHECK "Installation successful"
 
 # Verify installation
-print_status $BLUE $INFO "Verifying installation..."
 if [ -f "/usr/local/bin/ggquick" ]; then
-    print_status $GREEN $CHECK "ggquick installed successfully"
-    print_status $BLUE $INFO "Ready to process Git events"
+    print_status $GREEN $CHECK "Ready to process Git events"
 else
     print_status $RED $ERROR "Installation verification failed"
     exit 1
