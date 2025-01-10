@@ -18,28 +18,43 @@ func main() {
 	debug := os.Getenv("DEBUG") == "true"
 	logger := log.New(debug)
 
-	// Log startup info
-	logger.Loading("Starting ggquick server...")
-	logger.Info("App: %s", os.Getenv("FLY_APP_NAME"))
-	logger.Info("Debug: %v", debug)
-	logger.Info("Port: %s", os.Getenv("PORT"))
+	// Single, clear startup sequence
+	logger.Loading("🚀 Starting ggquick server...")
+	logger.Info("🔧 Debug mode: %v", debug)
 
-	// Check environment variables
-	envVars := map[string]string{
-		"GITHUB_TOKEN":   os.Getenv("GITHUB_TOKEN"),
-		"OPENAI_API_KEY": os.Getenv("OPENAI_API_KEY"),
-		"PORT":           os.Getenv("PORT"),
-		"BIND":           os.Getenv("BIND"),
+	// Check environment
+	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+		logger.Success("✅ GITHUB_TOKEN configured")
+	} else {
+		logger.Error("❌ GITHUB_TOKEN not configured")
+		os.Exit(1)
+	}
+	if key := os.Getenv("OPENAI_API_KEY"); key != "" {
+		logger.Success("✅ OPENAI_API_KEY configured")
+	} else {
+		logger.Error("❌ OPENAI_API_KEY not configured")
+		os.Exit(1)
 	}
 
-	// Log environment status
-	for name, value := range envVars {
-		if value == "" {
-			logger.Error("Required environment variable not set: %s", name)
-			os.Exit(1)
-		}
-		logger.Success("Environment variable set: %s", name)
+	// Initialize components
+	logger.Loading("⚙️ Initializing components...")
+
+	aiGen := ai.New(logger)
+	logger.Success("✅ AI generator ready")
+
+	ghClient := github.New(logger)
+	logger.Success("✅ GitHub client ready")
+
+	hooksMgr := hooks.New(logger)
+	logger.Success("✅ Git hooks ready")
+
+	// Create and start server
+	srv, err := server.New(logger, aiGen, ghClient, hooksMgr)
+	if err != nil {
+		logger.Error("❌ Failed to create server: %v", err)
+		os.Exit(1)
 	}
+	logger.Success("✅ Server initialized")
 
 	// Create context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
@@ -50,38 +65,17 @@ func main() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		sig := <-sigCh
-		logger.Info("Received signal: %v", sig)
+		logger.Info("🛑 Received signal: %v", sig)
 		cancel()
 	}()
 
-	// Initialize server components
-	logger.Loading("Initializing server components...")
-
-	aiGen := ai.New(logger)
-	logger.Success("AI generator initialized")
-
-	ghClient := github.New(logger)
-	logger.Success("GitHub client initialized")
-
-	hooksMgr := hooks.New(logger)
-	logger.Success("Hooks manager initialized")
-
-	// Create and start server
-	srv, err := server.New(logger, aiGen, ghClient, hooksMgr)
-	if err != nil {
-		logger.Error("Failed to create server: %v", err)
-		os.Exit(1)
-	}
-	logger.Success("Server created successfully")
-
 	// Start server
-	logger.Loading("Starting HTTP server on %s...", envVars["BIND"])
 	if err := srv.Start(ctx); err != nil {
-		logger.Error("Server error: %v", err)
+		logger.Error("❌ Server error: %v", err)
 		os.Exit(1)
 	}
 
 	// Wait for shutdown
 	<-ctx.Done()
-	logger.Success("Server shutdown complete")
+	logger.Success("✨ Server shutdown complete")
 }
