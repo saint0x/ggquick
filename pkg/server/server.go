@@ -85,6 +85,13 @@ type HooksManager interface {
 	ValidateGitRepo(string) error
 }
 
+// Config holds server configuration
+type Config struct {
+	RepoURL string `json:"repo_url"`
+	Owner   string `json:"owner"`
+	Name    string `json:"name"`
+}
+
 // Server handles webhook events and PR creation
 type Server struct {
 	logger  *log.Logger
@@ -94,6 +101,7 @@ type Server struct {
 	srv     *http.Server
 	mu      sync.RWMutex
 	limiter *RateLimiter
+	config  *Config
 }
 
 // New creates a new server instance
@@ -111,12 +119,19 @@ func New(logger *log.Logger, ai AIGenerator, gh GitHubClient, hooks HooksManager
 		return nil, fmt.Errorf("hooks manager is required")
 	}
 
+	// Load config from installation directory
+	config, err := loadConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config: %w", err)
+	}
+
 	if logger.IsDebug() {
 		logger.Info("Initializing server with components:")
 		logger.Info("- AI Generator: ✓")
 		logger.Info("- GitHub Client: ✓")
 		logger.Info("- Hooks Manager: ✓")
 		logger.Info("- Rate Limiter: ✓")
+		logger.Info("- Repository: %s", config.RepoURL)
 	}
 
 	// Create rate limiter with 5 requests per second burst of 10
@@ -128,7 +143,84 @@ func New(logger *log.Logger, ai AIGenerator, gh GitHubClient, hooks HooksManager
 		github:  gh,
 		hooks:   hooks,
 		limiter: limiter,
+		config:  config,
 	}, nil
+}
+
+// loadConfig loads configuration from the installation directory
+func loadConfig() (*Config, error) {
+	// In deployed environment, use /app/ggquick.json
+	// In local environment, use /usr/local/bin/ggquick.json
+	configPath := "/usr/local/bin/ggquick.json"
+	if os.Getenv("FLY_APP_NAME") != "" {
+		configPath = "/app/ggquick.json"
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	var config Config
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	// In deployed environment, allow empty config
+	if os.Getenv("FLY_APP_NAME") != "" {
+		return &config, nil
+	}
+
+	// For local environment, require valid URL and parse owner/name
+	if config.RepoURL == "" {
+		return nil, fmt.Errorf("repository URL is required")
+	}
+
+	// Parse owner and name from URL if not set
+	if config.Owner == "" || config.Name == "" {
+		parts := strings.Split(strings.TrimSuffix(config.RepoURL, ".git"), "/")
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("invalid repository URL format")
+		}
+		config.Owner = parts[len(parts)-2]
+		config.Name = parts[len(parts)-1]
+	}
+
+	return &config, nil
+}
+
+// SaveConfig saves the current configuration
+func SaveConfig(repoURL string) error {
+	// Parse owner and name from URL
+	parts := strings.Split(strings.TrimSuffix(repoURL, ".git"), "/")
+	if len(parts) < 2 {
+		return fmt.Errorf("invalid repository URL format")
+	}
+
+	config := Config{
+		RepoURL: repoURL,
+		Owner:   parts[len(parts)-2],
+		Name:    parts[len(parts)-1],
+	}
+
+	// Marshal config
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	// In deployed environment, use /app/ggquick.json
+	// In local environment, use /usr/local/bin/ggquick.json
+	configPath := "/usr/local/bin/ggquick.json"
+	if os.Getenv("FLY_APP_NAME") != "" {
+		configPath = "/app/ggquick.json"
+	}
+
+	if err := os.WriteFile(configPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write config file: %w", err)
+	}
+
+	return nil
 }
 
 // rateLimit middleware applies rate limiting
@@ -286,6 +378,13 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if repository is configured
+	if s.config.RepoURL == "" {
+		s.logger.Error("❌ Repository not configured")
+		http.Error(w, "Repository not configured. Please run 'ggquick start <repository-url>' first", http.StatusBadRequest)
+		return
+	}
+
 	// Parse request body
 	var payload struct {
 		Ref string `json:"ref"`
@@ -304,7 +403,7 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 
 	// Initialize GitHub client
 	s.logger.Loading("🔐 Initializing GitHub client...")
-	if err := s.hooks.InitGitHub(os.Getenv("GITHUB_TOKEN"), "saint0x", "z-sample-repo"); err != nil {
+	if err := s.hooks.InitGitHub(os.Getenv("GITHUB_TOKEN"), s.config.Owner, s.config.Name); err != nil {
 		s.logger.Error("❌ Failed to initialize GitHub client: %v", err)
 		http.Error(w, "Failed to initialize GitHub", http.StatusInternalServerError)
 		return
@@ -313,7 +412,7 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 
 	// Get default branch
 	s.logger.Loading("🔍 Getting default branch...")
-	defaultBranch, err := s.github.GetDefaultBranch(r.Context(), "saint0x", "z-sample-repo")
+	defaultBranch, err := s.github.GetDefaultBranch(r.Context(), s.config.Owner, s.config.Name)
 	if err != nil {
 		s.logger.Warning("⚠️ Failed to get default branch: %v", err)
 		defaultBranch = "main" // Fallback to main if we can't get default branch
@@ -330,13 +429,13 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 
 	// Try to get diff first
 	s.logger.Loading("📝 Attempting to get diff from GitHub...")
-	diffURL, diffErr := s.github.GetDiff(r.Context(), "saint0x", "z-sample-repo", defaultBranch, branchName)
+	diffURL, diffErr := s.github.GetDiff(r.Context(), s.config.Owner, s.config.Name, defaultBranch, branchName)
 	if diffErr != nil {
 		s.logger.Warning("⚠️ Could not get diff against %s: %v", defaultBranch, diffErr)
 		s.logger.Loading("🔍 Getting commit message...")
 
 		// Get the commit message from GitHub
-		commitMsg, err := s.github.GetCommitMessage(r.Context(), "saint0x", "z-sample-repo", payload.SHA)
+		commitMsg, err := s.github.GetCommitMessage(r.Context(), s.config.Owner, s.config.Name, payload.SHA)
 		if err != nil {
 			s.logger.Warning("⚠️ Failed to get commit message: %v", err)
 			commitMsg = "feat: improve resilience in PR generation" // Default if we can't get the real message
@@ -357,9 +456,9 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Try to get contributing guide, but don't fail if not found
+	// Try to get contributing guide
 	s.logger.Loading("📚 Checking for contributing guide...")
-	guide, err := s.github.GetContributingGuide(r.Context(), "saint0x", "z-sample-repo")
+	guide, err := s.github.GetContributingGuide(r.Context(), s.config.Owner, s.config.Name)
 	if err != nil {
 		s.logger.Warning("⚠️ No contributing guide found: %v", err)
 	} else if guide != "" {

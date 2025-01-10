@@ -22,6 +22,9 @@ WORKDIR /app
 COPY --from=builder /app/server .
 COPY --from=builder /app/sysprompt.json .
 
+# Create empty config file
+RUN echo '{"repo_url":"","owner":"","name":""}' > ggquick.json
+
 # Expose the port
 EXPOSE 8080
 
