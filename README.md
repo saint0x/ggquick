@@ -108,4 +108,8 @@ DEBUG=true ggquick start
 3. Verify webhook:
 ```bash
 ggquick check --webhook
-``` 
+```
+
+---
+
+Built for [Theo](https://x.com/t3dotgg) with some of the same design philosophy and opinionations as [ghquick-cli](https://github.com/saint0x/ghquick-cli)
