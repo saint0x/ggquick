@@ -7,6 +7,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 CHECK="✓"
 INFO="ℹ"
+ERROR="✗"
 
 # Function to print status messages
 print_status() {
@@ -21,18 +22,20 @@ print_status $BLUE $INFO "Checking prerequisites..."
 
 # Check Go installation
 if ! command -v go &> /dev/null; then
-    print_status $RED "✗" "Error: Go is not installed"
+    print_status $RED $ERROR "Go is not installed"
     exit 1
 fi
+print_status $GREEN $CHECK "Go is installed"
 
 # Load environment variables
 ENV_FILE=".env"
 [ -f ".env.local" ] && ENV_FILE=".env.local"
 
 if [ ! -f "$ENV_FILE" ]; then
-    print_status $RED "✗" "Error: No $ENV_FILE file found"
+    print_status $RED $ERROR "No $ENV_FILE file found"
     exit 1
 fi
+print_status $GREEN $CHECK "Found $ENV_FILE"
 
 # Source env vars for current session only
 while IFS='=' read -r key value; do
@@ -44,35 +47,59 @@ while IFS='=' read -r key value; do
 done < "$ENV_FILE"
 
 # Verify required variables
-if [ -z "$GITHUB_TOKEN" ]; then
-    print_status $RED "✗" "Error: GITHUB_TOKEN not found in $ENV_FILE"
-    exit 1
+REQUIRED_VARS=("GITHUB_TOKEN" "OPENAI_API_KEY")
+for var in "${REQUIRED_VARS[@]}"; do
+    if [ -z "${!var}" ]; then
+        print_status $RED $ERROR "$var not found in $ENV_FILE"
+        exit 1
+    fi
+done
+print_status $GREEN $CHECK "Required environment variables verified"
+
+# Clean previous build
+print_status $BLUE $INFO "Cleaning previous build..."
+if [ -f "/usr/local/bin/ggquick" ]; then
+    sudo rm /usr/local/bin/ggquick
 fi
 
-if [ -z "$OPENAI_API_KEY" ]; then
-    print_status $RED "✗" "Error: OPENAI_API_KEY not found in $ENV_FILE"
+# Download dependencies
+print_status $BLUE $INFO "Downloading dependencies..."
+if ! go mod download; then
+    print_status $RED $ERROR "Failed to download dependencies"
     exit 1
 fi
+print_status $GREEN $CHECK "Dependencies downloaded"
 
-print_status $GREEN $CHECK "Prerequisites satisfied"
+# Run installation tests
+print_status $BLUE $INFO "Running installation tests..."
+if ! go test ./pkg/hooks >/dev/null 2>&1; then
+    print_status $RED $ERROR "Installation tests failed"
+    exit 1
+fi
+print_status $GREEN $CHECK "Installation tests passed"
 
-# Build and install
+# Build binary
 print_status $BLUE $INFO "Building ggquick..."
-
-if go build -o /tmp/ggquick ./cmd; then
-    print_status $GREEN $CHECK "Build successful"
-else
-    print_status $RED "✗" "Build failed"
-    rm -f /tmp/ggquick
+if ! go build -o ggquick ./cmd; then
+    print_status $RED $ERROR "Build failed"
     exit 1
 fi
+print_status $GREEN $CHECK "Build successful"
 
-print_status $BLUE $INFO "Installing to /usr/local/bin..."
-if sudo mv /tmp/ggquick "/usr/local/bin/"; then
-    print_status $GREEN $CHECK "Installation complete"
-    print_status $BLUE $INFO "Try running: ggquick --help"
+# Install binary
+print_status $BLUE $INFO "Installing ggquick..."
+if ! sudo mv ggquick /usr/local/bin/; then
+    print_status $RED $ERROR "Installation failed"
+    exit 1
+fi
+print_status $GREEN $CHECK "Installation successful"
+
+# Verify installation
+print_status $BLUE $INFO "Verifying installation..."
+if [ -f "/usr/local/bin/ggquick" ]; then
+    print_status $GREEN $CHECK "ggquick installed successfully"
+    print_status $BLUE $INFO "Ready to process Git events"
 else
-    print_status $RED "✗" "Installation failed"
-    rm -f /tmp/ggquick
+    print_status $RED $ERROR "Installation verification failed"
     exit 1
 fi 

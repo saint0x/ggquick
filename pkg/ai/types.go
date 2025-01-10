@@ -1,24 +1,21 @@
 package ai
 
-// RepoInfo contains all relevant repository information
+// RepoInfo contains repository information
 type RepoInfo struct {
-	Files            []string          `json:"files"`
-	Changes          map[string]Change `json:"changes"`
-	CommitMessage    string            `json:"commit_message"`
-	BranchName       string            `json:"branch_name"`
-	ContributingFile string            `json:"contributing_file,omitempty"`
+	BranchName    string
+	CommitMessage string
+	Changes       map[string]Change
 }
 
 // Change represents a file change
 type Change struct {
-	Path     string   `json:"path"`
-	Added    []string `json:"added"`
-	Removed  []string `json:"removed"`
-	Modified []string `json:"modified"`
+	Path     string
+	Content  string
+	IsDelete bool
 }
 
-// PRContent represents generated PR content
+// PRContent contains pull request content
 type PRContent struct {
-	Title       string `json:"title"`
-	Description string `json:"description"`
+	Title       string
+	Description string
 }

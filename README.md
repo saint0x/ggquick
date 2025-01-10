@@ -4,83 +4,108 @@ AI-powered PR generator that creates detailed, conversational pull requests from
 
 ## Features
 
-- 🤖 Automatically generates PRs when you push any branch
+- 🤖 Automatically generates PRs when you push new branches
 - 🎯 Creates detailed, conversational PR descriptions that explain the changes thoroughly
 - 📝 Follows repository contributing guidelines when generating PRs
-- 🔄 Handles rate limiting for webhook events
-- 🔒 Secure token management for GitHub and OpenAI
-- 🌟 Supports all branch types (feature, fix, docs, etc.)
-- 🔍 AI-powered analysis of code changes
-- 📊 Smart PR title and description generation
+- 🔄 Simple and reliable rate limiting
+- 🚀 Fast and lightweight implementation
 
 ## Installation
 
+1. Clone the repository:
 ```bash
-# Clone the repository
 git clone https://github.com/saint0x/ggquick
 cd ggquick
-
-# Build and install
-./build.sh
 ```
 
-## Setup
-
-1. Create a `.env` file in the project root:
-```
-GITHUB_TOKEN=your_github_token
-OPENAI_API_KEY=your_openai_key
-```
-
-2. Start listening for changes:
+2. Set up environment:
 ```bash
-ggquick start
+cp .env.example .env
+```
+
+3. Edit `.env` and add your credentials:
+```env
+GITHUB_TOKEN=your_github_token      # GitHub personal access token
+OPENAI_API_KEY=your_openai_key     # OpenAI API key
+DEBUG=true                         # Optional: Enable debug logging
+```
+
+4. Install ggquick:
+```bash
+./build.sh
 ```
 
 ## Usage
 
-1. Create and switch to a new branch:
+1. Configure a repository:
 ```bash
-git checkout -b your-branch-name
+ggquick apply https://github.com/user/repo
 ```
+This will:
+- Validate your environment
+- Configure the repository
+- Set up the GitHub webhook
+- Verify the connection
 
-2. Make your changes and commit them:
+2. Start the service:
 ```bash
-git add .
-git commit -m "your commit message"
+ggquick start
 ```
+This will:
+- Start the local server
+- Connect to the remote server
+- Begin processing Git events
 
-3. Push your branch:
+3. Check server status:
 ```bash
-git push origin your-branch-name
+ggquick check
 ```
+This will:
+- Verify local server health
+- Check remote server connection
+- Validate webhook configuration
 
-ggquick will automatically:
-- Detect your push
-- Analyze the changes
-- Generate a detailed, conversational PR description
-- Create a pull request on GitHub
+## How it Works
+
+1. When you push changes:
+- ggquick detects the push event
+- Analyzes your changes
+- Generates a detailed PR description
+- Creates a pull request automatically
+
+2. The PR will include:
+- A clear, descriptive title
+- Detailed explanation of changes
+- Impact analysis
+- Any relevant context
 
 ## Commands
 
-- `ggquick start` - Start listening for Git events
+- `ggquick apply <repo-url>` - Configure a repository
+- `ggquick start` - Start the service
 - `ggquick check` - Check server status
-- `ggquick stop` - Stop the server
+- `ggquick stop` - Stop the service
 
 ## Environment Variables
 
-- `GITHUB_TOKEN` - Your GitHub personal access token
-- `OPENAI_API_KEY` - Your OpenAI API key
+- `GITHUB_TOKEN` - GitHub personal access token (required)
+- `OPENAI_API_KEY` - OpenAI API key (required)
 - `DEBUG` - Enable debug logging (optional)
+- `PORT` - Custom port for local server (optional, default: 8080)
 
-## Contributing
+## Troubleshooting
 
-1. Fork the repository
-2. Create your feature branch
-3. Make your changes
-4. Push to your branch
-5. Create a Pull Request
+1. Check server status:
+```bash
+ggquick check
+```
 
-## License
+2. View debug logs:
+```bash
+DEBUG=true ggquick start
+```
 
-MIT License - see LICENSE for details 
+3. Verify webhook:
+```bash
+ggquick check --webhook
+``` 

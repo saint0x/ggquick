@@ -1,6 +1,9 @@
 # Build stage
 FROM golang:1.21-alpine AS builder
 
+# Add build argument to force rebuild
+ARG CACHEBUST=1
+
 # Set working directory
 WORKDIR /app
 
@@ -8,7 +11,6 @@ WORKDIR /app
 COPY go.mod go.sum ./
 COPY pkg ./pkg/
 COPY cmd ./cmd/
-COPY sysprompt.json ./
 
 # Build the application
 RUN go build -o server ./cmd/server
@@ -18,12 +20,8 @@ FROM alpine:latest AS final
 
 WORKDIR /app
 
-# Copy the binary and config from builder
+# Copy the binary from builder
 COPY --from=builder /app/server .
-COPY --from=builder /app/sysprompt.json .
-
-# Create empty config file
-RUN echo '{"repo_url":"","owner":"","name":""}' > ggquick.json
 
 # Expose the port
 EXPOSE 8080

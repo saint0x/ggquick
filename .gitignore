@@ -5,6 +5,7 @@ TODO.md
 # Build
 bin/
 dist/
+ggquick
 
 # IDE
 .idea/
@@ -12,6 +13,9 @@ dist/
 
 # OS
 .DS_Store
+Thumbs.db
+*.swp
+*.swo
 
 # Go
 *.exe
@@ -21,6 +25,15 @@ dist/
 *.dylib
 *.test
 *.out
-go.work.env
+go.work
+go.work.sum
+
+# Environment
 .env
-.env
+*.env
+.env.*
+!.env.example
+
+# Local config
+ggquick.json
+*.local.json

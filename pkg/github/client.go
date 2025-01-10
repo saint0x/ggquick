@@ -26,66 +26,24 @@ func New(logger *log.Logger) *Client {
 		return nil
 	}
 
-	// Validate token by making a test API call
 	ts := oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: token},
 	)
 	tc := oauth2.NewClient(context.Background(), ts)
-	client := github.NewClient(tc)
-
-	// Test the token with a simple API call
-	ctx := context.Background()
-	_, resp, err := client.Users.Get(ctx, "")
-	if err != nil {
-		if resp != nil && resp.StatusCode == 401 {
-			logger.Error("Invalid GitHub token: authentication failed")
-			return nil
-		}
-		logger.Warning("Could not validate GitHub token: %v", err)
-	}
 
 	return &Client{
-		client: client,
+		client: github.NewClient(tc),
 		logger: logger,
 	}
 }
 
-// CreatePR creates a new pull request
-func (c *Client) CreatePR(ctx context.Context, owner, repo, title, body, head, base string) (*github.PullRequest, error) {
-	// Format head branch to include owner for cross-repo PRs
-	// If head doesn't contain ':', prefix it with owner
-	if !strings.Contains(head, ":") {
-		head = fmt.Sprintf("%s:%s", owner, head)
-	}
-
-	c.logger.Debug("Creating PR: title=%s, head=%s, base=%s", title, head, base)
-	pr, resp, err := c.client.PullRequests.Create(ctx, owner, repo, &github.NewPullRequest{
-		Title: github.String(title),
-		Body:  github.String(body),
-		Head:  github.String(head),
-		Base:  github.String(base),
-	})
+// CreatePullRequest creates a new pull request
+func (c *Client) CreatePullRequest(ctx context.Context, owner, repo string, pr *github.NewPullRequest) (*github.PullRequest, error) {
+	pullRequest, _, err := c.client.PullRequests.Create(ctx, owner, repo, pr)
 	if err != nil {
-		if resp != nil {
-			c.logger.Warning("Failed to create PR: status=%d", resp.StatusCode)
-			if resp.StatusCode == 422 {
-				c.logger.Debug("This might be due to PR already existing or invalid branch names")
-				// Check if PR already exists
-				existingPRs, _, listErr := c.client.PullRequests.List(ctx, owner, repo, &github.PullRequestListOptions{
-					Head: head,
-					Base: base,
-				})
-				if listErr == nil && len(existingPRs) > 0 {
-					c.logger.Warning("PR already exists between these branches")
-					return existingPRs[0], nil
-				}
-			}
-		}
 		return nil, fmt.Errorf("failed to create PR: %w", err)
 	}
-
-	c.logger.Debug("Successfully created PR #%d", pr.GetNumber())
-	return pr, nil
+	return pullRequest, nil
 }
 
 // GetDefaultBranch gets the default branch for a repository
@@ -202,77 +160,27 @@ func (c *Client) GetPRs(ctx context.Context, owner, repo string, limit int) ([]*
 
 // GetDiff gets the diff for a branch
 func (c *Client) GetDiff(ctx context.Context, owner, repo, base, head string) (string, error) {
-	// First try to get the base branch to check if it exists
-	branches, _, err := c.client.Repositories.ListBranches(ctx, owner, repo, &github.BranchListOptions{})
+	comp, _, err := c.client.Repositories.CompareCommits(
+		ctx,
+		owner,
+		repo,
+		base,
+		head,
+		&github.ListOptions{},
+	)
 	if err != nil {
-		c.logger.Warning("Failed to list branches: %v", err)
-		// If we can't list branches, try the diff anyway
-		comp, resp, err := c.client.Repositories.CompareCommits(ctx, owner, repo, base, head, &github.ListOptions{})
-		if err != nil {
-			if resp != nil && resp.StatusCode == 404 {
-				return "", fmt.Errorf("base branch %s not found", base)
-			}
-			return "", fmt.Errorf("failed to get diff: %w", err)
-		}
-		return comp.GetDiffURL(), nil
-	}
-
-	// Check if base branch exists
-	baseExists := false
-	for _, branch := range branches {
-		if branch.GetName() == base {
-			baseExists = true
-			break
-		}
-	}
-
-	if !baseExists {
-		c.logger.Warning("Base branch %s not found in repository", base)
-		// Try main as fallback
-		if base != "main" {
-			c.logger.Debug("Retrying diff with main as base branch")
-			return c.GetDiff(ctx, owner, repo, "main", head)
-		}
-		return "", fmt.Errorf("base branch %s not found", base)
-	}
-
-	// Get the diff
-	comp, resp, err := c.client.Repositories.CompareCommits(ctx, owner, repo, base, head, &github.ListOptions{})
-	if err != nil {
-		if resp != nil {
-			c.logger.Warning("Failed to get diff: status=%d", resp.StatusCode)
-		}
 		return "", fmt.Errorf("failed to get diff: %w", err)
 	}
 
-	c.logger.Debug("Successfully retrieved diff between %s...%s", base, head)
 	return comp.GetDiffURL(), nil
 }
 
 // GetCommitMessage gets the commit message for a SHA
 func (c *Client) GetCommitMessage(ctx context.Context, owner, repo, sha string) (string, error) {
-	// First try using Git API
-	commit, resp, err := c.client.Git.GetCommit(ctx, owner, repo, sha)
+	commit, _, err := c.client.Git.GetCommit(ctx, owner, repo, sha)
 	if err != nil {
-		if resp != nil && resp.StatusCode == 404 {
-			c.logger.Debug("Commit not found via Git API, trying Repositories API...")
-			// Try getting commit through Repositories API instead
-			repoCommit, repoResp, err := c.client.Repositories.GetCommit(ctx, owner, repo, sha, nil)
-			if err != nil {
-				if repoResp != nil {
-					c.logger.Warning("Failed to get commit via Repositories API: status=%d", repoResp.StatusCode)
-				}
-				return "", fmt.Errorf("failed to get commit through both APIs: %w", err)
-			}
-			c.logger.Debug("Successfully retrieved commit via Repositories API")
-			return repoCommit.GetCommit().GetMessage(), nil
-		}
-		if resp != nil {
-			c.logger.Warning("Failed to get commit via Git API: status=%d", resp.StatusCode)
-		}
 		return "", fmt.Errorf("failed to get commit: %w", err)
 	}
 
-	c.logger.Debug("Successfully retrieved commit via Git API")
 	return commit.GetMessage(), nil
 }

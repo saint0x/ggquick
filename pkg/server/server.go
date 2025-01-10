@@ -57,6 +57,20 @@ type Server struct {
 
 // New creates a new server instance
 func New(logger *log.Logger, generator *ai.Generator, github GitHubClient, hooks HooksManager) (*Server, error) {
+	// Validate required components
+	if logger == nil {
+		return nil, fmt.Errorf("logger is required")
+	}
+	if generator == nil {
+		return nil, fmt.Errorf("AI generator is required")
+	}
+	if github == nil {
+		return nil, fmt.Errorf("GitHub client is required")
+	}
+	if hooks == nil {
+		return nil, fmt.Errorf("hooks manager is required")
+	}
+
 	// Create rate limiter: 1 request per second with burst of 5
 	limiter := &RateLimiter{
 		limiter: rate.NewLimiter(rate.Every(time.Second), 5),
@@ -74,6 +88,11 @@ func New(logger *log.Logger, generator *ai.Generator, github GitHubClient, hooks
 
 // Start starts the HTTP server
 func (s *Server) Start(ctx context.Context) error {
+	// Validate server state
+	if err := s.validateState(); err != nil {
+		return fmt.Errorf("invalid server state: %w", err)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/webhook", s.handleWebhook)
 	mux.HandleFunc("/health", s.handleHealth)
@@ -379,5 +398,25 @@ func (s *Server) processPushEvent(ctx context.Context, event *github.PushEvent) 
 	}
 
 	s.logger.Success("✨ PR created successfully")
+	return nil
+}
+
+// validateState ensures all required components are initialized
+func (s *Server) validateState() error {
+	if s.logger == nil {
+		return fmt.Errorf("logger not initialized")
+	}
+	if s.generator == nil {
+		return fmt.Errorf("AI generator not initialized")
+	}
+	if s.github == nil {
+		return fmt.Errorf("GitHub client not initialized")
+	}
+	if s.hooks == nil {
+		return fmt.Errorf("hooks manager not initialized")
+	}
+	if s.limiter == nil {
+		return fmt.Errorf("rate limiter not initialized")
+	}
 	return nil
 }
