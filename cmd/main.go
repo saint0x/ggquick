@@ -11,6 +11,7 @@ func main() {
 		fmt.Println("  ggquick start              - Start the local ggquick server")
 		fmt.Println("  ggquick apply [repo-url]   - Apply ggquick to a repository")
 		fmt.Println("  ggquick check              - Check if ggquick server is running")
+		fmt.Println("  ggquick stop               - Stop the local ggquick server")
 		os.Exit(1)
 	}
 
@@ -36,6 +37,9 @@ func main() {
 
 	case "check":
 		err = handleCheck()
+
+	case "stop":
+		err = handleStop()
 
 	default:
 		fmt.Printf("Unknown command: %s\n", os.Args[1])
