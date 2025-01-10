@@ -7,8 +7,6 @@ AI-powered PR generator that creates detailed, conversational pull requests from
 - 🤖 Automatically generates PRs when you push new branches
 - 🎯 Creates detailed, conversational PR descriptions that explain the changes thoroughly
 - 📝 Follows repository contributing guidelines when generating PRs
-- 🔄 Simple and reliable rate limiting
-- 🚀 Fast and lightweight implementation
 
 ## Installation
 
