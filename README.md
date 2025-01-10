@@ -77,6 +77,10 @@ This will:
 - Impact analysis
 - Any relevant context
 
+## Example PR
+
+![Example of a generated pull request](example-pr.png)
+
 ## Commands
 
 - `ggquick apply <repo-url>` - Configure a repository
