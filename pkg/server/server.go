@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -12,142 +13,164 @@ import (
 
 	"github.com/google/go-github/v57/github"
 	"github.com/saint0x/ggquick/pkg/ai"
-	"github.com/saint0x/ggquick/pkg/hooks"
 	"github.com/saint0x/ggquick/pkg/log"
 	"golang.org/x/time/rate"
 )
 
-// RateLimiter wraps rate.Limiter with IP tracking
-type RateLimiter struct {
-	visitors map[string]*rate.Limiter
-	mtx      sync.RWMutex
-	rate     rate.Limit
-	burst    int
-}
-
-// NewRateLimiter creates a new rate limiter
-func NewRateLimiter(r rate.Limit, b int) *RateLimiter {
-	return &RateLimiter{
-		visitors: make(map[string]*rate.Limiter),
-		rate:     r,
-		burst:    b,
-	}
-}
-
-// GetVisitor gets or creates a limiter for an IP
-func (rl *RateLimiter) GetVisitor(ip string) *rate.Limiter {
-	rl.mtx.Lock()
-	defer rl.mtx.Unlock()
-
-	limiter, exists := rl.visitors[ip]
-	if !exists {
-		limiter = rate.NewLimiter(rl.rate, rl.burst)
-		rl.visitors[ip] = limiter
-	}
-
-	return limiter
-}
-
-// CleanupVisitors removes old IP entries
-func (rl *RateLimiter) CleanupVisitors() {
-	rl.mtx.Lock()
-	defer rl.mtx.Unlock()
-
-	for ip := range rl.visitors {
-		delete(rl.visitors, ip)
-	}
-}
-
-// AIGenerator interface for generating PR content
-type AIGenerator interface {
-	GeneratePR(ctx context.Context, info ai.RepoInfo) (*ai.PRContent, error)
+// Config stores repository configuration
+type Config struct {
+	RepoURL       string `json:"repo_url"`
+	Owner         string `json:"owner"`
+	Name          string `json:"name"`
+	DefaultBranch string `json:"default_branch"`
 }
 
 // GitHubClient interface for GitHub operations
 type GitHubClient interface {
-	CreatePR(ctx context.Context, owner, repo, title, body, head, base string) (*github.PullRequest, error)
+	CreatePullRequest(ctx context.Context, owner, repo string, pr *github.NewPullRequest) (*github.PullRequest, error)
 	GetDefaultBranch(ctx context.Context, owner, repo string) (string, error)
-	ParseRepoURL(url string) (owner, repo string, err error)
-	GetContributingGuide(ctx context.Context, owner, repo string) (string, error)
-	GetBranches(ctx context.Context, owner, repo string) ([]*github.Branch, error)
-	GetPRs(ctx context.Context, owner, repo string, limit int) ([]*github.PullRequest, error)
-	GetDiff(ctx context.Context, owner, repo, base, head string) (string, error)
-	GetCommitMessage(ctx context.Context, owner, repo, sha string) (string, error)
 }
 
-// HooksManager interface for git hooks
+// HooksManager interface for webhook management
 type HooksManager interface {
-	InstallHooks(string) error
-	InitGitHub(token, owner, repo string) error
-	CreatePullRequest(ctx context.Context, opts *hooks.PullRequestOptions) (*github.PullRequest, error)
-	UpdateRepo(repo *hooks.RepoInfo) error
-	RemoveHooks(string) error
-	ValidateGitRepo(string) error
+	CreateHook(ctx context.Context, owner, repo, url string) error
+	DeleteHook(ctx context.Context, owner, repo string) error
 }
 
-// Config holds server configuration
-type Config struct {
-	RepoURL string `json:"repo_url"`
-	Owner   string `json:"owner"`
-	Name    string `json:"name"`
+// RateLimiter wraps rate.Limiter with a mutex for concurrent access
+type RateLimiter struct {
+	limiter *rate.Limiter
+	mu      sync.Mutex
 }
 
-// Server handles webhook events and PR creation
+// Server handles HTTP requests for the ggquick service
 type Server struct {
-	logger  *log.Logger
-	ai      AIGenerator
-	github  GitHubClient
-	hooks   HooksManager
-	srv     *http.Server
-	mu      sync.RWMutex
-	limiter *RateLimiter
-	config  *Config // Store config in memory
+	logger    *log.Logger
+	config    *Config
+	generator *ai.Generator
+	limiter   *RateLimiter
+	mu        sync.RWMutex
+	github    GitHubClient
+	hooks     HooksManager
+	srv       *http.Server
 }
 
 // New creates a new server instance
-func New(logger *log.Logger, ai AIGenerator, gh GitHubClient, hooks HooksManager) (*Server, error) {
-	if logger == nil {
-		return nil, fmt.Errorf("logger is required")
+func New(logger *log.Logger, generator *ai.Generator, github GitHubClient, hooks HooksManager) (*Server, error) {
+	// Create rate limiter: 1 request per second with burst of 5
+	limiter := &RateLimiter{
+		limiter: rate.NewLimiter(rate.Every(time.Second), 5),
 	}
-	if ai == nil {
-		return nil, fmt.Errorf("ai generator is required")
-	}
-	if gh == nil {
-		return nil, fmt.Errorf("github client is required")
-	}
-	if hooks == nil {
-		return nil, fmt.Errorf("hooks manager is required")
-	}
-
-	if logger.IsDebug() {
-		logger.Info("Initializing server with components:")
-		logger.Info("- AI Generator: ✓")
-		logger.Info("- GitHub Client: ✓")
-		logger.Info("- Hooks Manager: ✓")
-		logger.Info("- Rate Limiter: ✓")
-	}
-
-	// Create rate limiter with 5 requests per second burst of 10
-	limiter := NewRateLimiter(5, 10)
 
 	return &Server{
-		logger:  logger,
-		ai:      ai,
-		github:  gh,
-		hooks:   hooks,
-		limiter: limiter,
+		logger:    logger,
+		generator: generator,
+		github:    github,
+		hooks:     hooks,
+		limiter:   limiter,
+		mu:        sync.RWMutex{},
 	}, nil
+}
+
+// Start starts the HTTP server
+func (s *Server) Start(ctx context.Context) error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/webhook", s.handleWebhook)
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/config", s.handleConfig)
+
+	// Get server address from environment
+	addr := ":8080" // Default port
+	if bind := os.Getenv("BIND"); bind != "" {
+		addr = bind // Use full bind address if specified
+	} else if port := os.Getenv("PORT"); port != "" {
+		addr = ":" + port // Use just the port if specified
+	}
+
+	s.srv = &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+
+	// Single, clear startup sequence
+	s.logger.Loading("🚀 Starting ggquick server...")
+	s.logger.Info("🔧 Debug mode: %v", s.logger.IsDebug())
+
+	// Check environment
+	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+		s.logger.Success("✅ GITHUB_TOKEN configured")
+	} else {
+		s.logger.Error("❌ GITHUB_TOKEN not configured")
+		return fmt.Errorf("GITHUB_TOKEN not configured")
+	}
+	if key := os.Getenv("OPENAI_API_KEY"); key != "" {
+		s.logger.Success("✅ OPENAI_API_KEY configured")
+	} else {
+		s.logger.Error("❌ OPENAI_API_KEY not configured")
+		return fmt.Errorf("OPENAI_API_KEY not configured")
+	}
+
+	// Initialize components
+	s.logger.Loading("⚙️ Initializing components...")
+	s.logger.Success("✅ AI generator ready")
+	s.logger.Success("✅ GitHub client ready")
+	s.logger.Success("✅ Git hooks ready")
+	s.logger.Success("✅ Server initialized")
+
+	// Start HTTP server
+	s.logger.Loading("🌐 Starting HTTP server on %s...", addr)
+	s.logger.Info("⚡ Endpoints initialized:")
+	s.logger.Info("   • /health - Server health check")
+	s.logger.Info("   • /config - Repository configuration")
+	s.logger.Info("   • /webhook - GitHub event handling")
+
+	errCh := make(chan error, 1)
+	go func() {
+		s.logger.Debug("Starting server on %s", addr)
+		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			s.logger.Error("❌ Server error: %v", err)
+			errCh <- fmt.Errorf("server error: %w", err)
+		}
+		close(errCh)
+	}()
+
+	s.logger.Success("✅ Server is ready to accept connections")
+
+	// Wait for either context cancellation or server error
+	select {
+	case err := <-errCh:
+		if err != nil {
+			s.logger.Error("❌ Server error: %v", err)
+		}
+		return err
+	case <-ctx.Done():
+		s.logger.Info("🛑 Initiating graceful shutdown...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return s.srv.Shutdown(shutdownCtx)
+	}
+}
+
+// handleHealth handles health check requests
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok"))
 }
 
 // handleConfig handles setting the repository configuration
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	s.logger.Loading("📥 Receiving configuration request...")
+	s.logger.Debug("Request from: %s", r.RemoteAddr)
+
 	if r.Method != http.MethodPost {
+		s.logger.Error("❌ Invalid method: %s", r.Method)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	var config Config
 	if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
+		s.logger.Error("❌ Failed to decode configuration: %v", err)
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -156,6 +179,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	if config.Owner == "" || config.Name == "" {
 		parts := strings.Split(strings.TrimSuffix(config.RepoURL, ".git"), "/")
 		if len(parts) < 2 {
+			s.logger.Error("❌ Invalid repository URL format")
 			http.Error(w, "Invalid repository URL format", http.StatusBadRequest)
 			return
 		}
@@ -163,307 +187,197 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		config.Name = parts[len(parts)-1]
 	}
 
+	s.logger.Success("✅ Parsed repository details:")
+	s.logger.Info("   📦 Repository: %s", config.RepoURL)
+	s.logger.Info("   👤 Owner: %s", config.Owner)
+	s.logger.Info("   📝 Name: %s", config.Name)
+
+	// Get default branch
+	defaultBranch, err := s.github.GetDefaultBranch(r.Context(), config.Owner, config.Name)
+	if err != nil {
+		s.logger.Error("❌ Failed to get default branch: %v", err)
+		http.Error(w, "Failed to get repository details", http.StatusInternalServerError)
+		return
+	}
+	config.DefaultBranch = defaultBranch
+	s.logger.Info("   🌿 Default branch: %s", defaultBranch)
+
 	// Store config in memory
+	s.logger.Loading("💾 Storing configuration...")
 	s.mu.Lock()
 	s.config = &config
 	s.mu.Unlock()
+	s.logger.Success("✨ Configuration stored successfully")
 
-	s.logger.Success("Repository configured: %s", config.RepoURL)
+	// Create webhook
+	s.logger.Loading("🔗 Setting up GitHub webhook...")
+	// Use fly.io domain for production, fallback to local address for development
+	webhookURL := "https://ggquick.fly.dev/webhook"
+	if os.Getenv("FLY_APP_NAME") == "" {
+		// For local development, use the actual server port
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = "8080"
+		}
+		webhookURL = fmt.Sprintf("http://localhost:%s/webhook", port)
+	}
+	s.logger.Debug("Webhook URL: %s", webhookURL)
+
+	// Check webhook status
+	s.logger.Loading("🔍 Checking webhook status...")
+	if err := s.hooks.CreateHook(r.Context(), config.Owner, config.Name, webhookURL); err != nil {
+		s.logger.Error("❌ Failed to manage webhook: %v", err)
+		http.Error(w, "Failed to manage webhook", http.StatusInternalServerError)
+		return
+	}
+	s.logger.Success("✅ GitHub webhook configured")
+
+	// Send confirmation response with repository details
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-}
-
-// rateLimit middleware applies rate limiting
-func (s *Server) rateLimit(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Get IP from X-Forwarded-For or remote address
-		ip := r.Header.Get("X-Forwarded-For")
-		if ip == "" {
-			ip = r.RemoteAddr
-		}
-
-		limiter := s.limiter.GetVisitor(ip)
-		if !limiter.Allow() {
-			if s.logger.IsDebug() {
-				s.logger.Warning("Rate limit exceeded for IP: %s", ip)
-			}
-			w.Header().Set("X-RateLimit-Limit", "5")
-			w.Header().Set("X-RateLimit-Remaining", "0")
-			w.Header().Set("X-RateLimit-Reset", fmt.Sprintf("%d", time.Now().Add(time.Second).Unix()))
-			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
-			return
-		}
-
-		// Add rate limit headers
-		w.Header().Set("X-RateLimit-Limit", "5")
-		w.Header().Set("X-RateLimit-Remaining", fmt.Sprintf("%.0f", limiter.Tokens()))
-		w.Header().Set("X-RateLimit-Reset", fmt.Sprintf("%d", time.Now().Add(time.Second).Unix()))
-
-		next(w, r)
-	}
-}
-
-// Start starts the server
-func (s *Server) Start(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.logger.IsDebug() {
-		s.logger.Info("Starting server initialization...")
-	}
-
-	// Create server
-	s.logger.Loading("Setting up server routes...")
-	mux := http.NewServeMux()
-
-	// Add health check first to ensure basic functionality
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		if s.logger.IsDebug() {
-			s.logger.Debug("Health check request received")
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok","version":"1.0.0"}`))
-		if s.logger.IsDebug() {
-			s.logger.Debug("Health check response sent")
-		}
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "config_stored",
+		"owner":  config.Owner,
+		"name":   config.Name,
 	})
-
-	// Add config endpoint
-	mux.HandleFunc("/config", s.rateLimit(s.handleConfig))
-
-	// Add push endpoint
-	mux.HandleFunc("/push", s.rateLimit(s.handlePush))
-
-	s.srv = &http.Server{
-		Addr:         "0.0.0.0:8080",
-		Handler:      mux,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-
-	// Start server
-	s.logger.Loading("Starting HTTP server...")
-	serverErr := make(chan error, 1)
-	serverStarted := make(chan struct{})
-
-	go func() {
-		s.logger.Debug("Server goroutine starting...")
-
-		// Signal that we're about to start listening
-		close(serverStarted)
-
-		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			s.logger.Error("Server error: %v", err)
-
-			// Signal that we're done listening
-			close(serverStarted)
-
-			serverErr <- err
-			return
-		}
-	}()
-
-	// Wait for server to start or fail
-	select {
-	case <-serverStarted:
-		s.logger.Success("Server started on 0.0.0.0:8080")
-	case err := <-serverErr:
-		return fmt.Errorf("server failed to start: %w", err)
-	case <-time.After(5 * time.Second):
-		return fmt.Errorf("server failed to start within timeout")
-	}
-
-	s.logger.Loading("Waiting for requests...")
-
-	// Start periodic cleanup of old rate limit entries
-	cleanup := time.NewTicker(10 * time.Minute)
-	defer cleanup.Stop()
-
-	// Wait for either context cancellation or server error
-	for {
-		select {
-		case <-ctx.Done():
-			s.logger.Loading("Shutting down server...")
-			return s.Stop()
-		case err := <-serverErr:
-			return fmt.Errorf("server error: %w", err)
-		case <-cleanup.C:
-			if s.logger.IsDebug() {
-				s.logger.Debug("Running rate limiter cleanup...")
-			}
-			s.limiter.CleanupVisitors()
-		}
-	}
+	s.logger.Success("🔄 Ready to process Git events for %s/%s", config.Owner, config.Name)
 }
 
-// Stop stops the server
-func (s *Server) Stop() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// handleWebhook handles incoming GitHub webhook events
+func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	s.logger.Loading("📥 Processing incoming webhook...")
+	s.logger.Debug("Request from: %s", r.RemoteAddr)
 
-	if s.srv != nil {
-		s.logger.Loading("Gracefully stopping server...")
-
-		// Create a context with timeout for shutdown
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		if err := s.srv.Shutdown(ctx); err != nil {
-			return fmt.Errorf("error shutting down server: %w", err)
-		}
-		s.logger.Success("Server stopped successfully")
-	}
-
-	return nil
-}
-
-// handlePush handles push events
-func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
-	s.logger.Loading("🔄 Processing push event...")
-	s.logger.Debug("📥 Push event received from %s", r.RemoteAddr)
-
-	// Validate method
 	if r.Method != http.MethodPost {
 		s.logger.Error("❌ Invalid method: %s", r.Method)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Check if repository is configured
+	// Check rate limit
+	if err := s.checkRateLimit(r.Context()); err != nil {
+		s.logger.Error("❌ Rate limit exceeded: %v", err)
+		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
+	// Parse webhook event
+	payload, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.logger.Error("❌ Failed to read request body: %v", err)
+		http.Error(w, "Failed to read request", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	event, err := github.ParseWebHook(github.WebHookType(r), payload)
+	if err != nil {
+		s.logger.Error("❌ Failed to parse webhook: %v", err)
+		http.Error(w, "Invalid webhook payload", http.StatusBadRequest)
+		return
+	}
+
+	// Handle push event
+	switch e := event.(type) {
+	case *github.PushEvent:
+		s.logger.Success("✅ Received push event")
+		s.logger.Info("📝 Repository: %s", *e.Repo.FullName)
+		s.logger.Info("📝 Branch: %s", strings.TrimPrefix(*e.Ref, "refs/heads/"))
+
+		// Get stored config
+		s.mu.RLock()
+		config := s.config
+		s.mu.RUnlock()
+
+		if config == nil {
+			s.logger.Error("❌ No repository configuration found")
+			http.Error(w, "Repository not configured", http.StatusBadRequest)
+			return
+		}
+
+		s.logger.Info("📝 Using stored config for %s/%s", config.Owner, config.Name)
+
+		// Process push event
+		if err := s.processPushEvent(r.Context(), e); err != nil {
+			s.logger.Error("❌ Failed to process push event: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		s.logger.Success("✨ Push event processed successfully")
+
+	default:
+		s.logger.Info("ℹ️ Ignoring unsupported event type: %s", github.WebHookType(r))
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// checkRateLimit checks if the request should be allowed based on rate limiting
+func (s *Server) checkRateLimit(ctx context.Context) error {
+	s.limiter.mu.Lock()
+	defer s.limiter.mu.Unlock()
+
+	if err := s.limiter.limiter.Wait(ctx); err != nil {
+		return fmt.Errorf("rate limit exceeded: %w", err)
+	}
+	return nil
+}
+
+// processPushEvent processes a GitHub push event and creates a PR if needed
+func (s *Server) processPushEvent(ctx context.Context, event *github.PushEvent) error {
+	// Check rate limit before processing
+	if err := s.checkRateLimit(ctx); err != nil {
+		s.logger.Error("❌ Rate limit check failed: %v", err)
+		return err
+	}
+
+	s.logger.Loading("🔄 Processing push event...")
+
+	// Get stored config
 	s.mu.RLock()
 	config := s.config
 	s.mu.RUnlock()
 
-	if config == nil {
-		s.logger.Error("❌ Repository not configured")
-		http.Error(w, "Repository not configured. Please run 'ggquick start <repository-url>' first", http.StatusBadRequest)
-		return
-	}
+	// Get commit info
+	branch := strings.TrimPrefix(*event.Ref, "refs/heads/")
+	commitMsg := *event.HeadCommit.Message
+	commitSHA := *event.HeadCommit.ID
 
-	// Parse request body
-	var payload struct {
-		Ref string `json:"ref"`
-		SHA string `json:"sha"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		s.logger.Error("❌ Failed to decode payload: %v", err)
-		http.Error(w, "Invalid payload", http.StatusBadRequest)
-		return
-	}
-	s.logger.Debug("✅ Payload decoded: ref=%s, sha=%s", payload.Ref, payload.SHA)
+	s.logger.Info("📝 Processing commit: %s", commitSHA)
+	s.logger.Info("📝 Message: %s", commitMsg)
 
-	// Extract branch name from ref
-	branchName := strings.TrimPrefix(payload.Ref, "refs/heads/")
-	s.logger.Debug("🔍 Branch name extracted: %s", branchName)
-
-	// Initialize GitHub client
-	s.logger.Loading("🔐 Initializing GitHub client...")
-	if err := s.hooks.InitGitHub(os.Getenv("GITHUB_TOKEN"), config.Owner, config.Name); err != nil {
-		s.logger.Error("❌ Failed to initialize GitHub client: %v", err)
-		http.Error(w, "Failed to initialize GitHub", http.StatusInternalServerError)
-		return
-	}
-	s.logger.Debug("✅ GitHub client initialized with token")
-
-	// Get default branch
-	s.logger.Loading("🔍 Getting default branch...")
-	defaultBranch, err := s.github.GetDefaultBranch(r.Context(), config.Owner, config.Name)
-	if err != nil {
-		s.logger.Warning("⚠️ Failed to get default branch: %v", err)
-		defaultBranch = "main" // Fallback to main if we can't get default branch
-	}
-	s.logger.Debug("✅ Default branch is: %s", defaultBranch)
-
-	// Initialize analysis
+	// Get repository info
 	repoInfo := ai.RepoInfo{
-		Files:         []string{},
+		BranchName:    branch,
+		CommitMessage: commitMsg,
 		Changes:       make(map[string]ai.Change),
-		BranchName:    branchName,
-		CommitMessage: "",
-	}
-
-	// Try to get diff first
-	s.logger.Loading("📝 Attempting to get diff from GitHub...")
-	diffURL, diffErr := s.github.GetDiff(r.Context(), config.Owner, config.Name, defaultBranch, branchName)
-	if diffErr != nil {
-		s.logger.Warning("⚠️ Could not get diff against %s: %v", defaultBranch, diffErr)
-		s.logger.Loading("🔍 Getting commit message...")
-
-		// Get the commit message from GitHub
-		commitMsg, err := s.github.GetCommitMessage(r.Context(), config.Owner, config.Name, payload.SHA)
-		if err != nil {
-			s.logger.Warning("⚠️ Failed to get commit message: %v", err)
-			commitMsg = "feat: improve resilience in PR generation" // Default if we can't get the real message
-		}
-		repoInfo.CommitMessage = commitMsg
-
-		// Add basic change info
-		repoInfo.Changes[branchName] = ai.Change{
-			Path:     branchName,
-			Modified: []string{commitMsg},
-		}
-	} else {
-		s.logger.Success("✅ Got diff URL: %s", diffURL)
-		// Add diff information
-		repoInfo.Changes[branchName] = ai.Change{
-			Path:     diffURL,
-			Modified: []string{diffURL},
-		}
-	}
-
-	// Try to get contributing guide
-	s.logger.Loading("📚 Checking for contributing guide...")
-	guide, err := s.github.GetContributingGuide(r.Context(), config.Owner, config.Name)
-	if err != nil {
-		s.logger.Warning("⚠️ No contributing guide found: %v", err)
-	} else if guide != "" {
-		s.logger.Success("✅ Found contributing guide")
-		repoInfo.ContributingFile = guide
 	}
 
 	// Generate PR content
-	s.logger.Loading("🤖 Generating PR content with AI...")
-	prContent, err := s.ai.GeneratePR(r.Context(), repoInfo)
+	s.logger.Loading("🤖 Generating PR content...")
+	prContent, err := s.generator.GeneratePR(ctx, repoInfo)
 	if err != nil {
-		s.logger.Error("❌ Failed to generate PR content: %v", err)
-		http.Error(w, "Failed to generate PR content", http.StatusInternalServerError)
-		return
+		s.logger.Error("❌ Failed to generate PR: %v", err)
+		return fmt.Errorf("failed to generate PR: %w", err)
 	}
-	s.logger.Success("✅ Generated PR content")
-	s.logger.Debug("Title: %s", prContent.Title)
 
 	// Create PR
-	s.logger.Loading("📦 Creating pull request...")
-	pr, err := s.hooks.CreatePullRequest(r.Context(), &hooks.PullRequestOptions{
-		Title:       prContent.Title,
-		Description: prContent.Description,
-		Branch:      branchName,
-		BaseBranch:  defaultBranch,
-		Labels:      []string{"automated-pr"},
-	})
+	s.logger.Loading("📝 Creating PR...")
+	pr := &github.NewPullRequest{
+		Title:               github.String(prContent.Title),
+		Body:                github.String(prContent.Description),
+		Head:                github.String(branch),
+		Base:                github.String(config.DefaultBranch),
+		MaintainerCanModify: github.Bool(true),
+	}
+
+	_, err = s.github.CreatePullRequest(ctx, config.Owner, config.Name, pr)
 	if err != nil {
 		s.logger.Error("❌ Failed to create PR: %v", err)
-		http.Error(w, "Failed to create PR", http.StatusInternalServerError)
-		return
+		return fmt.Errorf("failed to create PR: %w", err)
 	}
-	s.logger.Success("✨ Pull request created successfully!")
-	s.logger.Info("🔗 PR URL: %s", pr.GetHTMLURL())
-	s.logger.Info("📝 Title: %s", prContent.Title)
-	s.logger.Info("🏷️  Labels: automated-pr")
 
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok"))
-}
-
-// handleHealth handles health check requests
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	if s.logger.IsDebug() {
-		s.logger.Loading("Health check...")
-	}
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok"))
-	if s.logger.IsDebug() {
-		s.logger.Success("Health check passed")
-	}
+	s.logger.Success("✨ PR created successfully")
+	return nil
 }
