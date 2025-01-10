@@ -7,6 +7,7 @@ import (
 	"syscall"
 
 	"github.com/saint0x/ggquick/pkg/ai"
+	"github.com/saint0x/ggquick/pkg/config"
 	"github.com/saint0x/ggquick/pkg/github"
 	"github.com/saint0x/ggquick/pkg/hooks"
 	"github.com/saint0x/ggquick/pkg/log"
@@ -22,24 +23,27 @@ func main() {
 	logger.Loading("🚀 Starting ggquick server...")
 	logger.Info("🔧 Debug mode: %v", debug)
 
-	// Check environment
-	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
-		logger.Success("✅ GITHUB_TOKEN configured")
-	} else {
-		logger.Error("❌ GITHUB_TOKEN not configured")
+	// Validate environment
+	logger.Loading("🔍 Validating environment...")
+	env, err := config.Validate(logger)
+	if err != nil {
+		logger.Error("❌ Environment validation failed: %v", err)
 		os.Exit(1)
 	}
-	if key := os.Getenv("OPENAI_API_KEY"); key != "" {
-		logger.Success("✅ OPENAI_API_KEY configured")
-	} else {
-		logger.Error("❌ OPENAI_API_KEY not configured")
-		os.Exit(1)
-	}
+	logger.Success("✅ Environment validated")
 
 	// Initialize components
 	logger.Loading("⚙️ Initializing components...")
 
 	aiGen := ai.New(logger)
+	if aiGen == nil {
+		logger.Error("❌ Failed to initialize AI generator")
+		os.Exit(1)
+	}
+	if err := aiGen.Initialize(env.OpenAIKey); err != nil {
+		logger.Error("❌ Failed to initialize AI generator: %v", err)
+		os.Exit(1)
+	}
 	logger.Success("✅ AI generator ready")
 
 	ghClient := github.New(logger)
@@ -50,7 +54,11 @@ func main() {
 	logger.Success("✅ GitHub client ready")
 
 	hooksMgr := hooks.New(logger)
-	if err := hooksMgr.InitGitHub(os.Getenv("GITHUB_TOKEN")); err != nil {
+	if hooksMgr == nil {
+		logger.Error("❌ Failed to initialize hooks manager")
+		os.Exit(1)
+	}
+	if err := hooksMgr.InitGitHub(env.GitHubToken); err != nil {
 		logger.Error("❌ Failed to initialize hooks manager: %v", err)
 		os.Exit(1)
 	}
