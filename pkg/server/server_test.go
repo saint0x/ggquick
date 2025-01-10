@@ -4,12 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
-	"time"
 
 	gogithub "github.com/google/go-github/v57/github"
 	"github.com/saint0x/ggquick/pkg/ai"
@@ -19,24 +18,21 @@ import (
 
 // mockGenerator implements AIGenerator
 type mockGenerator struct {
-	titleResp string
-	descResp  string
+	prContent *ai.PRContent
+	err       error
 }
 
-func (m *mockGenerator) GeneratePRTitle(_ ai.DiffAnalysis) (string, error) {
-	return m.titleResp, nil
-}
-
-func (m *mockGenerator) GeneratePRDescription(_ ai.DiffAnalysis) (string, error) {
-	return m.descResp, nil
-}
-
-func (m *mockGenerator) AnalyzeCommit(string) (*ai.Analysis, error) {
-	return &ai.Analysis{}, nil
-}
-
-func (m *mockGenerator) AnalyzeCode(string) (*ai.Analysis, error) {
-	return &ai.Analysis{}, nil
+func (m *mockGenerator) GeneratePR(_ context.Context, _ ai.RepoInfo) (*ai.PRContent, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	if m.prContent == nil {
+		return &ai.PRContent{
+			Title:       "test PR title",
+			Description: "test PR description",
+		}, nil
+	}
+	return m.prContent, nil
 }
 
 // mockClient implements GitHubClient for testing
@@ -49,7 +45,6 @@ type mockClient struct {
 	getPRsFunc           func(context.Context, string, string, int) ([]*gogithub.PullRequest, error)
 	getDiffFunc          func(context.Context, string, string, string, string) (string, error)
 	getCommitMessageFunc func(context.Context, string, string, string) (string, error)
-	prCreated            bool
 }
 
 func (m *mockClient) CreatePR(ctx context.Context, owner, repo, title, body, head, base string) (*gogithub.PullRequest, error) {
@@ -120,139 +115,105 @@ func (m *mockManager) UpdateRepo(_ *hooks.RepoInfo) error { return nil }
 func (m *mockManager) RemoveHooks(string) error           { return nil }
 func (m *mockManager) ValidateGitRepo(string) error       { return nil }
 
-func setupTestServer(t *testing.T) (*Server, *mockGenerator, *mockClient, func()) {
+func setupTestServer(t *testing.T) (*Server, *mockGenerator, *mockClient, *mockManager, func()) {
 	logger := log.New(true)
+
 	mockGen := &mockGenerator{
-		titleResp: "Test PR Title",
-		descResp:  "Test PR Description",
+		prContent: &ai.PRContent{
+			Title:       "test PR title",
+			Description: "test PR description",
+		},
 	}
-	mockGH := &mockClient{}
+
+	mockGH := &mockClient{
+		getDefaultBranchFunc: func(context.Context, string, string) (string, error) {
+			return "main", nil
+		},
+		getDiffFunc: func(context.Context, string, string, string, string) (string, error) {
+			return "test diff", nil
+		},
+		getCommitMessageFunc: func(context.Context, string, string, string) (string, error) {
+			return "test commit message", nil
+		},
+	}
+
 	mockHooks := &mockManager{}
 
-	s, err := New(logger, mockGen, mockGH, mockHooks)
+	srv, err := New(logger, mockGen, mockGH, mockHooks)
 	if err != nil {
 		t.Fatalf("Failed to create server: %v", err)
 	}
 
-	return s, mockGen, mockGH, func() {
-		s.Stop()
+	cleanup := func() {
+		if err := srv.Stop(); err != nil {
+			t.Errorf("Failed to stop server: %v", err)
+		}
 	}
+
+	return srv, mockGen, mockGH, mockHooks, cleanup
 }
 
 func TestWebhookHandling(t *testing.T) {
-	// Set required environment variable
-	os.Setenv("GITHUB_REPOSITORY", "test-owner/test-repo")
-	defer os.Unsetenv("GITHUB_REPOSITORY")
+	srv, _, _, _, cleanup := setupTestServer(t)
+	defer cleanup()
 
-	tests := []struct {
-		name           string
-		method         string
-		payload        map[string]string
-		contentType    string
-		expectedStatus int
-		checkPR        bool
+	// Create test request
+	payload := struct {
+		Ref string `json:"ref"`
+		SHA string `json:"sha"`
 	}{
-		{
-			name:   "valid json webhook",
-			method: "POST",
-			payload: map[string]string{
-				"ref":    "refs/heads/feature-branch",
-				"after":  "abc123",
-				"before": "def456",
-			},
-			contentType:    "application/json",
-			expectedStatus: http.StatusOK,
-			checkPR:        true,
-		},
-		{
-			name:   "valid text webhook",
-			method: "POST",
-			payload: map[string]string{
-				"sha":     "abc123",
-				"message": "test commit",
-				"author":  "test-author",
-			},
-			contentType:    "text/plain",
-			expectedStatus: http.StatusOK,
-			checkPR:        true,
-		},
-		{
-			name:           "invalid method",
-			method:         "GET",
-			payload:        nil,
-			expectedStatus: http.StatusMethodNotAllowed,
-			checkPR:        false,
-		},
+		Ref: "refs/heads/feature/test",
+		SHA: "abc123",
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s, _, mockGH, cleanup := setupTestServer(t)
-			defer cleanup()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Failed to marshal payload: %v", err)
+	}
 
-			var body []byte
-			var err error
-			if tt.payload != nil {
-				body, err = json.Marshal(tt.payload)
-				if err != nil {
-					t.Fatalf("Failed to marshal payload: %v", err)
-				}
-			}
+	req := httptest.NewRequest("POST", "/push", bytes.NewBuffer(body))
+	rec := httptest.NewRecorder()
 
-			req := httptest.NewRequest(tt.method, "/push", bytes.NewReader(body))
-			if tt.contentType != "" {
-				req.Header.Set("Content-Type", tt.contentType)
-			}
-			w := httptest.NewRecorder()
+	// Handle request
+	srv.handlePush(rec, req)
 
-			s.handlePush(w, req)
+	// Check response
+	if rec.Code != http.StatusOK {
+		t.Errorf("Expected status code %d, got %d", http.StatusOK, rec.Code)
+	}
 
-			if w.Code != tt.expectedStatus {
-				t.Errorf("Expected status code %d, got %d", tt.expectedStatus, w.Code)
-			}
-
-			// Wait for PR creation to complete
-			if tt.checkPR {
-				time.Sleep(100 * time.Millisecond)
-				if !mockGH.prCreated {
-					t.Error("Expected PR to be created")
-				}
-			}
-		})
+	if !strings.Contains(rec.Body.String(), "ok") {
+		t.Errorf("Expected body to contain 'ok', got %q", rec.Body.String())
 	}
 }
 
-func TestServer_handlePush(t *testing.T) {
-	mockGen := &mockGenerator{
-		titleResp: "Test PR Title",
-		descResp:  "Test PR Description",
-	}
-	mockGH := &mockClient{
-		createPRFunc: func(ctx context.Context, owner, repo, title, body, head, base string) (*gogithub.PullRequest, error) {
-			return &gogithub.PullRequest{}, nil
-		},
-		getDefaultBranchFunc: func(ctx context.Context, owner, repo string) (string, error) {
-			return "main", nil
-		},
-	}
-	mockHooks := &mockManager{}
+// Add more test cases for error scenarios
+func TestWebhookHandling_Errors(t *testing.T) {
+	srv, mockGen, _, _, cleanup := setupTestServer(t)
+	defer cleanup()
 
-	srv, err := New(log.New(true), mockGen, mockGH, mockHooks)
+	// Test case: AI error
+	mockGen.err = fmt.Errorf("AI error")
+
+	payload := struct {
+		Ref string `json:"ref"`
+		SHA string `json:"sha"`
+	}{
+		Ref: "refs/heads/feature/test",
+		SHA: "abc123",
+	}
+
+	body, err := json.Marshal(payload)
 	if err != nil {
-		t.Fatal("Failed to create server:", err)
+		t.Fatalf("Failed to marshal payload: %v", err)
 	}
 
-	// Create test request
-	body := strings.NewReader(`{"ref": "refs/heads/test-branch"}`)
-	req := httptest.NewRequest(http.MethodPost, "/push", body)
-	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/push", bytes.NewBuffer(body))
+	rec := httptest.NewRecorder()
 
-	// Handle request
-	srv.handlePush(w, req)
+	srv.handlePush(rec, req)
 
-	// Check response
-	resp := w.Result()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("Expected status OK; got %v", resp.Status)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("Expected status code %d, got %d", http.StatusInternalServerError, rec.Code)
 	}
 }

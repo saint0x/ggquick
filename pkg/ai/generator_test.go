@@ -2,6 +2,7 @@ package ai
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"testing"
@@ -25,98 +26,74 @@ func (m *mockHTTPClient) Do(req *http.Request) (*http.Response, error) {
 	}, nil
 }
 
-func TestGeneratePRTitle(t *testing.T) {
+func TestGeneratePR(t *testing.T) {
 	logger := log.New(true)
 	gen := New(logger)
 
 	// Mock HTTP client
 	mockClient := &mockHTTPClient{
-		response: `{"choices":[{"message":{"content":"feat(server): Add webhook support"}}]}`,
+		response: `{"choices":[{"message":{"content":"feat(server): Add webhook support\n\nAdded webhook support to server:\n- New handleWebhook function\n- Support for POST requests"}}]}`,
 	}
-	gen.SetHTTPClient(mockClient)
+	gen.httpClient = mockClient
 
 	// Test data
-	diff := DiffAnalysis{
-		Files: []string{"pkg/server/server.go"},
+	info := RepoInfo{
+		Files:         []string{"pkg/server/server.go"},
+		BranchName:    "feature/webhook-support",
+		CommitMessage: "feat(server): Add webhook support",
 		Changes: map[string]Change{
 			"pkg/server/server.go": {
-				Path:      "pkg/server/server.go",
-				Added:     []string{"func handleWebhook()"},
-				Type:      "feature",
-				Component: "server",
+				Path:     "pkg/server/server.go",
+				Added:    []string{"func handleWebhook()"},
+				Modified: []string{"func main()"},
 			},
 		},
 	}
 
-	// Test PR title generation
-	title, err := gen.GeneratePRTitle(diff)
+	// Test PR generation
+	pr, err := gen.GeneratePR(context.Background(), info)
 	if err != nil {
-		t.Fatalf("Failed to generate PR title: %v", err)
+		t.Fatalf("Failed to generate PR: %v", err)
 	}
 
-	if title != "feat(server): Add webhook support" {
-		t.Errorf("Expected title %q, got %q", "feat(server): Add webhook support", title)
+	expectedTitle := "feat(server): Add webhook support"
+	if pr.Title != expectedTitle {
+		t.Errorf("Expected title %q, got %q", expectedTitle, pr.Title)
+	}
+
+	expectedDesc := "Added webhook support to server:\n- New handleWebhook function\n- Support for POST requests"
+	if pr.Description != expectedDesc {
+		t.Errorf("Expected description %q, got %q", expectedDesc, pr.Description)
 	}
 }
 
-func TestGeneratePRDescription(t *testing.T) {
+func TestGeneratePR_Error(t *testing.T) {
 	logger := log.New(true)
 	gen := New(logger)
 
-	// Mock HTTP client
+	// Mock HTTP client with error
 	mockClient := &mockHTTPClient{
-		response: `{"choices":[{"message":{"content":"Added webhook support to server:\n- New handleWebhook function\n- Support for POST requests"}}]}`,
+		err: io.ErrUnexpectedEOF,
 	}
-	gen.SetHTTPClient(mockClient)
+	gen.httpClient = mockClient
 
 	// Test data
-	diff := DiffAnalysis{
-		Files: []string{"pkg/server/server.go"},
+	info := RepoInfo{
+		Files:         []string{"pkg/server/server.go"},
+		BranchName:    "feature/webhook-support",
+		CommitMessage: "feat(server): Add webhook support",
 		Changes: map[string]Change{
 			"pkg/server/server.go": {
-				Path:      "pkg/server/server.go",
-				Added:     []string{"func handleWebhook()"},
-				Type:      "feature",
-				Component: "server",
+				Path:     "pkg/server/server.go",
+				Added:    []string{"func handleWebhook()"},
+				Modified: []string{"func main()"},
 			},
 		},
 	}
 
-	// Test PR description generation
-	desc, err := gen.GeneratePRDescription(diff)
-	if err != nil {
-		t.Fatalf("Failed to generate PR description: %v", err)
-	}
-
-	expected := "Added webhook support to server:\n- New handleWebhook function\n- Support for POST requests"
-	if desc != expected {
-		t.Errorf("Expected description %q, got %q", expected, desc)
-	}
-}
-
-func TestAnalyzeCommit(t *testing.T) {
-	logger := log.New(true)
-	gen := New(logger)
-
-	// Mock HTTP client
-	mockClient := &mockHTTPClient{
-		response: `{"choices":[{"message":{"content":"Type: feature\nComponent: server\nDescription: Add webhook support"}}]}`,
-	}
-	gen.SetHTTPClient(mockClient)
-
-	// Test commit analysis
-	analysis, err := gen.AnalyzeCommit("feat(server): Add webhook support")
-	if err != nil {
-		t.Fatalf("Failed to analyze commit: %v", err)
-	}
-
-	if analysis.Type != "feature" {
-		t.Errorf("Expected type %q, got %q", "feature", analysis.Type)
-	}
-	if analysis.Component != "server" {
-		t.Errorf("Expected component %q, got %q", "server", analysis.Component)
-	}
-	if analysis.Description != "Add webhook support" {
-		t.Errorf("Expected description %q, got %q", "Add webhook support", analysis.Description)
+	// Test PR generation with error
+	_, err := gen.GeneratePR(context.Background(), info)
+	if err == nil {
+		t.Error("Expected error, got nil")
 	}
 }

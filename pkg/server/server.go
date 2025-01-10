@@ -60,10 +60,7 @@ func (rl *RateLimiter) CleanupVisitors() {
 
 // AIGenerator interface for generating PR content
 type AIGenerator interface {
-	GeneratePRTitle(diff ai.DiffAnalysis) (string, error)
-	GeneratePRDescription(diff ai.DiffAnalysis) (string, error)
-	AnalyzeCommit(msg string) (*ai.Analysis, error)
-	AnalyzeCode(code string) (*ai.Analysis, error)
+	GeneratePR(ctx context.Context, info ai.RepoInfo) (*ai.PRContent, error)
 }
 
 // GitHubClient interface for GitHub operations
@@ -324,16 +321,19 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	s.logger.Debug("✅ Default branch is: %s", defaultBranch)
 
 	// Initialize analysis
-	var analysis ai.DiffAnalysis
-	analysis.Files = []string{}
-	analysis.Changes = make(map[string]ai.Change)
+	repoInfo := ai.RepoInfo{
+		Files:         []string{},
+		Changes:       make(map[string]ai.Change),
+		BranchName:    branchName,
+		CommitMessage: "",
+	}
 
 	// Try to get diff first
 	s.logger.Loading("📝 Attempting to get diff from GitHub...")
 	diffURL, diffErr := s.github.GetDiff(r.Context(), "saint0x", "z-sample-repo", defaultBranch, branchName)
 	if diffErr != nil {
 		s.logger.Warning("⚠️ Could not get diff against %s: %v", defaultBranch, diffErr)
-		s.logger.Loading("🔍 Analyzing commit message...")
+		s.logger.Loading("🔍 Getting commit message...")
 
 		// Get the commit message from GitHub
 		commitMsg, err := s.github.GetCommitMessage(r.Context(), "saint0x", "z-sample-repo", payload.SHA)
@@ -341,42 +341,19 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 			s.logger.Warning("⚠️ Failed to get commit message: %v", err)
 			commitMsg = "feat: improve resilience in PR generation" // Default if we can't get the real message
 		}
+		repoInfo.CommitMessage = commitMsg
 
-		// Analyze the commit message
-		commitAnalysis, err := s.ai.AnalyzeCommit(commitMsg)
-		if err != nil {
-			s.logger.Warning("⚠️ Failed to analyze commit: %v", err)
-			// Use default values from commit message format
-			if strings.HasPrefix(commitMsg, "feat") {
-				analysis.Changes[branchName] = ai.Change{
-					Type:      "feature",
-					Component: "core",
-				}
-			} else if strings.HasPrefix(commitMsg, "fix") {
-				analysis.Changes[branchName] = ai.Change{
-					Type:      "fix",
-					Component: "core",
-				}
-			} else {
-				analysis.Changes[branchName] = ai.Change{
-					Type:      "other",
-					Component: "core",
-				}
-			}
-		} else {
-			s.logger.Success("✅ Analyzed commit successfully")
-			analysis.Changes[branchName] = ai.Change{
-				Type:      commitAnalysis.Type,
-				Component: commitAnalysis.Component,
-			}
+		// Add basic change info
+		repoInfo.Changes[branchName] = ai.Change{
+			Path:     branchName,
+			Modified: []string{commitMsg},
 		}
 	} else {
 		s.logger.Success("✅ Got diff URL: %s", diffURL)
-		// Add diff information to analysis
-		analysis.Changes[branchName] = ai.Change{
-			Path:      diffURL,
-			Type:      "feature", // This could be improved by analyzing the diff
-			Component: branchName,
+		// Add diff information
+		repoInfo.Changes[branchName] = ai.Change{
+			Path:     diffURL,
+			Modified: []string{diffURL},
 		}
 	}
 
@@ -387,36 +364,28 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		s.logger.Warning("⚠️ No contributing guide found: %v", err)
 	} else if guide != "" {
 		s.logger.Success("✅ Found contributing guide")
-		analysis.ContributingGuide = guide
+		repoInfo.ContributingFile = guide
 	}
 
-	// Generate PR title and description
-	s.logger.Loading("🤖 Generating PR title with AI...")
-	title, err := s.ai.GeneratePRTitle(analysis)
+	// Generate PR content
+	s.logger.Loading("🤖 Generating PR content with AI...")
+	prContent, err := s.ai.GeneratePR(r.Context(), repoInfo)
 	if err != nil {
-		s.logger.Error("❌ Failed to generate PR title: %v", err)
-		http.Error(w, "Failed to generate PR title", http.StatusInternalServerError)
+		s.logger.Error("❌ Failed to generate PR content: %v", err)
+		http.Error(w, "Failed to generate PR content", http.StatusInternalServerError)
 		return
 	}
-	s.logger.Success("✅ Generated PR title: %s", title)
-
-	s.logger.Loading("🤖 Generating PR description with AI...")
-	desc, err := s.ai.GeneratePRDescription(analysis)
-	if err != nil {
-		s.logger.Error("❌ Failed to generate PR description: %v", err)
-		http.Error(w, "Failed to generate PR description", http.StatusInternalServerError)
-		return
-	}
-	s.logger.Success("✅ Generated PR description")
+	s.logger.Success("✅ Generated PR content")
+	s.logger.Debug("Title: %s", prContent.Title)
 
 	// Create PR
 	s.logger.Loading("📦 Creating pull request...")
 	pr, err := s.hooks.CreatePullRequest(r.Context(), &hooks.PullRequestOptions{
-		Title:       title,
-		Description: desc,
+		Title:       prContent.Title,
+		Description: prContent.Description,
 		Branch:      branchName,
-		BaseBranch:  defaultBranch,                               // Use the default branch we got earlier
-		Labels:      []string{analysis.Changes[branchName].Type}, // Use the type from our analysis
+		BaseBranch:  defaultBranch,
+		Labels:      []string{"automated-pr"},
 	})
 	if err != nil {
 		s.logger.Error("❌ Failed to create PR: %v", err)
@@ -425,15 +394,15 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logger.Success("✨ Pull request created successfully!")
 	s.logger.Info("🔗 PR URL: %s", pr.GetHTMLURL())
-	s.logger.Info("📝 Title: %s", title)
-	s.logger.Info("🏷️  Labels: %s", analysis.Changes[branchName].Type)
+	s.logger.Info("📝 Title: %s", prContent.Title)
+	s.logger.Info("🏷️  Labels: automated-pr")
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("ok"))
 }
 
 // handleHealth handles health check requests
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	if s.logger.IsDebug() {
 		s.logger.Loading("Health check...")
 	}

@@ -7,90 +7,22 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
-	"strings"
-	"sync"
-	"time"
 
 	"github.com/saint0x/ggquick/pkg/log"
 )
 
 const openAIEndpoint = "https://api.openai.com/v1/chat/completions"
 
-// SystemPrompts holds the prompts from sysprompt.json
-type SystemPrompts struct {
-	PRTitle struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	} `json:"pr_title"`
-	PRDescription struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	} `json:"pr_description"`
-	CodeAnalysis struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	} `json:"code_analysis"`
+// Generator handles AI-powered PR generation
+type Generator struct {
+	logger     *log.Logger
+	httpClient HTTPClient
+	sysPrompt  string
 }
 
 // HTTPClient interface for mocking http.Client
 type HTTPClient interface {
 	Do(req *http.Request) (*http.Response, error)
-}
-
-// Generator handles AI-powered PR content generation
-type Generator struct {
-	logger     *log.Logger
-	cache      sync.Map // Cache for analysis results
-	httpClient HTTPClient
-	prompts    *SystemPrompts
-}
-
-// Analysis represents code analysis results
-type Analysis struct {
-	Type        string
-	Component   string
-	Description string
-	CreatedAt   time.Time
-}
-
-// DiffAnalysis represents code changes
-type DiffAnalysis struct {
-	Files             []string          `json:"files"`
-	Additions         int               `json:"additions"`
-	Deletions         int               `json:"deletions"`
-	Changes           map[string]Change `json:"changes"`
-	ContributingGuide string            `json:"contributing_guide,omitempty"`
-}
-
-// Change represents a file change
-type Change struct {
-	Path      string   `json:"path"`
-	Added     []string `json:"added"`
-	Removed   []string `json:"removed"`
-	Modified  []string `json:"modified"`
-	Type      string   `json:"type"` // e.g., "feature", "fix", "refactor"
-	Component string   `json:"component"`
-}
-
-type openAIRequest struct {
-	Model       string          `json:"model"`
-	Messages    []openAIMessage `json:"messages"`
-	Temperature float64         `json:"temperature"`
-	MaxTokens   int             `json:"max_tokens"`
-}
-
-type openAIMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type openAIResponse struct {
-	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	} `json:"choices"`
 }
 
 // New creates a new Generator instance
@@ -100,98 +32,97 @@ func New(logger *log.Logger) *Generator {
 		httpClient: http.DefaultClient,
 	}
 
-	// Load system prompts
-	if err := g.loadSystemPrompts(); err != nil && logger.IsDebug() {
-		logger.Warning("Failed to load system prompts: %v", err)
+	// Load system prompt
+	if err := g.loadSystemPrompt(); err != nil {
+		logger.Warning("Failed to load system prompt: %v", err)
+		g.sysPrompt = "You are an AI assistant helping to generate clear and descriptive pull requests."
 	}
 
 	return g
 }
 
-// loadSystemPrompts loads prompts from sysprompt.json
-func (g *Generator) loadSystemPrompts() error {
-	// Try to find sysprompt.json in the workspace root
-	workspaceRoot := os.Getenv("WORKSPACE_ROOT")
-	if workspaceRoot == "" {
-		// Try to find it relative to the current directory
-		workspaceRoot = "."
-	}
-
-	data, err := os.ReadFile(filepath.Join(workspaceRoot, "sysprompt.json"))
+// loadSystemPrompt loads the PR generation prompt from sysprompt.json
+func (g *Generator) loadSystemPrompt() error {
+	data, err := os.ReadFile("sysprompt.json")
 	if err != nil {
 		return fmt.Errorf("failed to read sysprompt.json: %w", err)
 	}
 
-	var prompts SystemPrompts
+	var prompts map[string]string
 	if err := json.Unmarshal(data, &prompts); err != nil {
 		return fmt.Errorf("failed to parse sysprompt.json: %w", err)
 	}
 
-	g.prompts = &prompts
+	if prompt, ok := prompts["pr_description"]; ok {
+		g.sysPrompt = prompt
+	}
 	return nil
 }
 
-// SetHTTPClient sets a custom HTTP client (useful for testing)
-func (g *Generator) SetHTTPClient(client HTTPClient) {
-	g.httpClient = client
-}
+// GeneratePR generates a PR title and description based on repository information
+func (g *Generator) GeneratePR(ctx context.Context, info RepoInfo) (*PRContent, error) {
+	// Construct user prompt with all relevant info
+	userPrompt := fmt.Sprintf(`Generate a pull request title and description based on the following information:
 
-// GeneratePRTitle generates a PR title based on code changes and contributing guidelines
-func (g *Generator) GeneratePRTitle(diff DiffAnalysis) (string, error) {
-	var systemPrompt string
-	if g.prompts != nil {
-		systemPrompt = g.prompts.PRTitle.Content
-	} else {
-		systemPrompt = "You are a PR title generator. Generate a concise, descriptive title that follows contributing guidelines."
+Branch: %s
+Commit Message: %s
+
+Changed Files:
+%v
+
+Changes:
+%v
+
+`, info.BranchName, info.CommitMessage, info.Files, info.Changes)
+
+	if info.ContributingFile != "" {
+		userPrompt += fmt.Sprintf("\nContributing Guidelines:\n%s", info.ContributingFile)
 	}
 
-	// Include contributing guidelines in the user prompt
-	userPrompt := fmt.Sprintf("Generate a PR title for these changes:\n%+v", diff)
-	if diff.ContributingGuide != "" {
-		userPrompt = fmt.Sprintf("Contributing Guidelines:\n%s\n\n%s", diff.ContributingGuide, userPrompt)
-	}
-
-	title, err := g.generateWithAI(context.Background(), systemPrompt, userPrompt)
+	// Make request to OpenAI
+	content, err := g.generateWithAI(ctx, g.sysPrompt, userPrompt)
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("failed to generate PR: %w", err)
 	}
 
-	return strings.TrimSpace(title), nil
-}
+	// Parse response into title and description
+	lines := bytes.Split([]byte(content), []byte("\n"))
+	pr := &PRContent{}
 
-// GeneratePRDescription generates a PR description based on code changes and contributing guidelines
-func (g *Generator) GeneratePRDescription(diff DiffAnalysis) (string, error) {
-	var systemPrompt string
-	if g.prompts != nil {
-		systemPrompt = g.prompts.PRDescription.Content
-	} else {
-		systemPrompt = "You are a PR description generator. Generate a clear, detailed description that follows contributing guidelines."
+	for i, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		if pr.Title == "" {
+			pr.Title = string(line)
+		} else {
+			pr.Description = string(bytes.Join(lines[i:], []byte("\n")))
+			break
+		}
 	}
 
-	// Include contributing guidelines in the user prompt
-	userPrompt := fmt.Sprintf("Generate a PR description for these changes:\n%+v", diff)
-	if diff.ContributingGuide != "" {
-		userPrompt = fmt.Sprintf("Contributing Guidelines:\n%s\n\n%s", diff.ContributingGuide, userPrompt)
-	}
-
-	desc, err := g.generateWithAI(context.Background(), systemPrompt, userPrompt)
-	if err != nil {
-		return "", err
-	}
-
-	return strings.TrimSpace(desc), nil
+	return pr, nil
 }
 
 // generateWithAI makes a request to GPT-4
 func (g *Generator) generateWithAI(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
-	req := openAIRequest{
+	req := struct {
+		Model    string `json:"model"`
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+		Temperature float64 `json:"temperature"`
+	}{
 		Model: "gpt-4",
-		Messages: []openAIMessage{
+		Messages: []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
 		},
 		Temperature: 0.7,
-		MaxTokens:   1000,
 	}
 
 	data, err := json.Marshal(req)
@@ -199,12 +130,7 @@ func (g *Generator) generateWithAI(ctx context.Context, systemPrompt, userPrompt
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(
-		ctx,
-		"POST",
-		openAIEndpoint,
-		bytes.NewBuffer(data),
-	)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", openAIEndpoint, bytes.NewBuffer(data))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
@@ -222,7 +148,14 @@ func (g *Generator) generateWithAI(ctx context.Context, systemPrompt, userPrompt
 		return "", fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 
-	var aiResp openAIResponse
+	var aiResp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
 	if err := json.NewDecoder(resp.Body).Decode(&aiResp); err != nil {
 		return "", fmt.Errorf("failed to decode response: %w", err)
 	}
@@ -232,87 +165,4 @@ func (g *Generator) generateWithAI(ctx context.Context, systemPrompt, userPrompt
 	}
 
 	return aiResp.Choices[0].Message.Content, nil
-}
-
-// AnalyzeCommit analyzes a commit message
-func (g *Generator) AnalyzeCommit(msg string) (*Analysis, error) {
-	systemPrompt := "Analyze this commit message and extract the type (e.g., feature, fix, refactor) and component."
-	systemPrompt += "\nExpect conventional commit format: type(scope): description"
-
-	analysis, err := g.generateWithAI(context.Background(), systemPrompt, msg)
-	if err != nil {
-		return nil, err
-	}
-
-	// Parse AI response
-	lines := strings.Split(analysis, "\n")
-	result := &Analysis{CreatedAt: time.Now()}
-
-	for _, line := range lines {
-		if strings.HasPrefix(line, "Type:") {
-			result.Type = strings.TrimSpace(strings.TrimPrefix(line, "Type:"))
-		} else if strings.HasPrefix(line, "Component:") {
-			result.Component = strings.TrimSpace(strings.TrimPrefix(line, "Component:"))
-		} else if strings.HasPrefix(line, "Description:") {
-			result.Description = strings.TrimSpace(strings.TrimPrefix(line, "Description:"))
-		}
-	}
-
-	return result, nil
-}
-
-// AnalyzeCode analyzes code content
-func (g *Generator) AnalyzeCode(code string) (*Analysis, error) {
-	systemPrompt := "Analyze this code and determine if it's a feature, fix, refactor, etc. Consider error handling, tests, and complexity."
-
-	analysis, err := g.generateWithAI(context.Background(), systemPrompt, code)
-	if err != nil {
-		return nil, err
-	}
-
-	// Parse AI response
-	lines := strings.Split(analysis, "\n")
-	result := &Analysis{CreatedAt: time.Now()}
-
-	for _, line := range lines {
-		if strings.HasPrefix(line, "Type:") {
-			result.Type = strings.TrimSpace(strings.TrimPrefix(line, "Type:"))
-		} else if strings.HasPrefix(line, "Description:") {
-			result.Description = strings.TrimSpace(strings.TrimPrefix(line, "Description:"))
-		}
-	}
-
-	return result, nil
-}
-
-// CacheAnalysis stores analysis results in cache
-func (g *Generator) CacheAnalysis(key string, analysis *Analysis) {
-	g.cache.Store(key, analysis)
-}
-
-// GetCachedAnalysis retrieves analysis results from cache
-func (g *Generator) GetCachedAnalysis(key string) (*Analysis, bool) {
-	if value, ok := g.cache.Load(key); ok {
-		return value.(*Analysis), true
-	}
-	return nil, false
-}
-
-// IsAnalysisCacheExpired checks if an analysis is expired (older than 24 hours)
-func (g *Generator) IsAnalysisCacheExpired(key string) bool {
-	if value, ok := g.cache.Load(key); ok {
-		analysis := value.(*Analysis)
-		return time.Since(analysis.CreatedAt) > 24*time.Hour
-	}
-	return true
-}
-
-// CleanupExpiredCache removes expired entries from the cache
-func (g *Generator) CleanupExpiredCache() {
-	g.cache.Range(func(key, value interface{}) bool {
-		if g.IsAnalysisCacheExpired(key.(string)) {
-			g.cache.Delete(key)
-		}
-		return true
-	})
 }
