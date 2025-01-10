@@ -1,26 +1,45 @@
-# flyctl launch added from .gitignore
 # Development and planning
-**/DEVELOPMENT.md
-**/TODO.md
+DEVELOPMENT.md
+TODO.md
+*.todo
+*.plan
+
+# Git
+.git
+.gitignore
 
 # Build
-**/bin
-**/dist
+bin/
+dist/
+ggquick
 
 # IDE
-**/.idea
-**/.vscode
+.idea/
+.vscode/
 
 # OS
-**/.DS_Store
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
 
 # Go
-**/*.exe
-**/*.exe~
-**/*.dll
-**/*.so
-**/*.dylib
-**/*.test
-**/*.out
-**/go.work.env
-fly.toml
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+go.work.sum
+
+# Environment
+.env
+*.env
+.env.*
+!.env.example
+
+# Local config
+ggquick.json
+*.local.json

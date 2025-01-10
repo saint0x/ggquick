@@ -1,6 +1,8 @@
 # Development and planning
 DEVELOPMENT.md
 TODO.md
+*.todo
+*.plan
 
 # Build
 bin/
