@@ -50,7 +50,14 @@ func handleServe() error {
 	// Initialize server components
 	aiGen := ai.New(logger)
 	ghClient := github.New(logger)
+	if ghClient == nil {
+		return fmt.Errorf("failed to initialize GitHub client")
+	}
+
 	hooksMgr := hooks.New(logger)
+	if err := hooksMgr.InitGitHub(os.Getenv("GITHUB_TOKEN")); err != nil {
+		return fmt.Errorf("failed to initialize hooks manager: %w", err)
+	}
 
 	// Create and start server
 	srv, err := server.New(logger, aiGen, ghClient, hooksMgr)

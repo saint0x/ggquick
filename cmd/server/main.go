@@ -43,9 +43,17 @@ func main() {
 	logger.Success("✅ AI generator ready")
 
 	ghClient := github.New(logger)
+	if ghClient == nil {
+		logger.Error("❌ Failed to initialize GitHub client")
+		os.Exit(1)
+	}
 	logger.Success("✅ GitHub client ready")
 
 	hooksMgr := hooks.New(logger)
+	if err := hooksMgr.InitGitHub(os.Getenv("GITHUB_TOKEN")); err != nil {
+		logger.Error("❌ Failed to initialize hooks manager: %v", err)
+		os.Exit(1)
+	}
 	logger.Success("✅ Git hooks ready")
 
 	// Create and start server
